@@ -1,0 +1,70 @@
+# Keep the OTA writer only in the retained factory Recovery image. The normal
+# application exposes the enter-Recovery RPC through iris_ota_support_start().
+# CONFIG_ESP_IRIS_OTA is not set
+CONFIG_ESP_IRIS_USB_PRODUCT="Mosaico Gamepad USB"
+CONFIG_ESP_IRIS_HEALTH_TIMEOUT_MS=45000
+# Configuration RPC uses methods 1..6; Iris's own services need a few slots too,
+# so the default of 8 overflows (method 6 failed with ESP_ERR_NO_MEM).
+CONFIG_ESP_IRIS_MAX_RPC_HANDLERS=16
+
+# HID gamepad shares the ESP-Iris USB device (composite: 2x CDC + 3x HID +
+# one UAC2 audio function registered through the extra-interface hook).
+# ESP-Iris reserves the HID interface only when this count is non-zero.
+CONFIG_TINYUSB_CDC_COUNT=2
+CONFIG_TINYUSB_HID_COUNT=3
+
+# The USB audio path writes one 1 ms block per codec write and the isochronous
+# tasks sleep in tick units; a 100 Hz tick would round those to 10 ms and drop
+# audio. projects/audio runs the same sound card at 1 kHz.
+CONFIG_FREERTOS_HZ=1000
+
+# BLE HID (HOGP) gamepad plus Classic Bluetooth for the audio profiles.
+# Classic is the transport with wide host support (A2DP/HFP); LE Audio is not
+# enabled because many hosts still do not implement it. The controller runs in
+# dual mode and the two identities use different addresses and names.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BTDM=y
+# Classic audio profiles: A2DP sink (music) and HFP hands-free (microphone).
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_HFP_ENABLE=y
+CONFIG_BT_HFP_CLIENT_ENABLE=y
+CONFIG_BT_PBAC_ENABLED=y
+# HID over BR/EDR (Classic HID device) for the gamepad/keyboard classes.
+CONFIG_BT_HID_ENABLED=y
+CONFIG_BT_HID_DEVICE_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+# CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
+CONFIG_BT_GATTS_ENABLE=y
+
+# Memory-lean Bluetooth: one classic link is enough for the audio profile, and
+# the controller buffers were sized for multi-link use we do not need.
+CONFIG_BT_ACL_CONNECTIONS=2
+CONFIG_BT_CTRL_BR_EDR_MAX_ACL_CONN=1
+
+# Aggressive memory trimming for the Bluetooth stack: the gamepad only needs one
+# classic link with HFP hands-free (client) and one BLE HID link.
+# CONFIG_BT_HFP_AG_ENABLE is not set
+# CONFIG_BT_HFP_WBS_ENABLE is not set
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20
+CONFIG_BT_CTRL_BLE_ADV_REPORT_DISCARD_THRSHOLD=5
+CONFIG_BT_CTRL_HCI_CMD_NUM=2
+
+# The classic HID SDP record embeds the whole report descriptor (162 bytes);
+# the 300-byte default pad is too small and the record silently fails to
+# register, so HID over BR/EDR never becomes available.
+CONFIG_BT_SDP_ATTR_LEN=1024
+CONFIG_BT_SDP_PAD_LEN=1024
+
+# Temporary: the BLE HID connect/disconnect transitions are logged at debug
+# level by esp_hid and are needed to see why the phone drops the link.
+
+# Temporary: esp_hid logs HID connect/disconnect transitions at debug level.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# The BT controller is the largest internal-RAM consumer left; moving its
+# buffers to PSRAM frees the internal DMA pool that the display pipeline needs.
+CONFIG_BT_CTRL_ALLOW_MALLOC_FROM_SPIRAM=y
+
