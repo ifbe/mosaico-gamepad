@@ -20,10 +20,25 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
     (void)base;
     (void)event_data;
     switch ((esp_hidd_event_t)id) {
-    case ESP_HIDD_CONNECT_EVENT:
+    case ESP_HIDD_CONNECT_EVENT: {
         s_connected = true;
         ESP_LOGI(TAG, "host connected");
+        /* Keep the ACL poll interval short so reports stay prompt. The event
+         * carries no peer address, so apply it to the bonded peers (there is
+         * exactly one in practice). This replaces the previous patch inside
+         * esp_hid/src/bt_hidd.c and keeps the IDF checkout untouched. */
+        const int bonded = esp_bt_gap_get_bond_device_num();
+        esp_bd_addr_t peers[4];
+        int count = bonded < (int)(sizeof(peers) / sizeof(peers[0]))
+                        ? bonded
+                        : (int)(sizeof(peers) / sizeof(peers[0]));
+        if (count > 0 && esp_bt_gap_get_bond_device_list(&count, peers) == ESP_OK) {
+            for (int i = 0; i < count; ++i) {
+                (void)esp_bt_gap_set_qos(peers[i], 20);
+            }
+        }
         break;
+    }
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
         ESP_LOGI(TAG, "host disconnected");

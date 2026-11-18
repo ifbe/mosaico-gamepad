@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "app_ui.h"
 #include "esp_iris.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -19,21 +18,27 @@
 static const char *TAG = "app_cfg";
 #define NVS_NAMESPACE "gamepad"
 
-/* The key was renamed from "classes" to "usb_hid" so that devices flashed
- * earlier pick up the new, endpoint-aware default instead of the old 0x7. */
-#define NVS_KEY_CLASSES "usb_hid"
+/* The key was renamed twice so that already-flashed devices pick up a new
+ * default instead of the value stored under the old key: "classes" -> "usb_hid"
+ * (endpoint-aware default) -> "usb_hid2" (motion interface in the default).
+ * Bluetooth, audio and identity keys are unaffected. */
+#define NVS_KEY_CLASSES "usb_hid2"
 
-/* Default when NVS has no record: every USB HID class plus the sound card.
- * ESP-Iris runs console-only (data link disabled), so the free IN endpoints
- * are 0x83..0x87: three HID interfaces take 0x83..0x85, the UAC2 microphone
- * takes 0x86 and 0x87 stays unused. */
-static uint32_t s_classes = APP_CLASS_ALL;
+/* Default when NVS has no record: the generic classes, the motion interface and
+ * the sound card. ESP-Iris runs console-only (data link disabled), so the free
+ * IN endpoints are 0x83..0x87: keyboard/mouse/gamepad take 0x83..0x85, the
+ * motion interface takes 0x86 and the UAC2 microphone 0x87. */
+static uint32_t s_classes = APP_CLASS_USB_DEFAULT;
 static bool s_usb_audio = true;
 static uint32_t s_bt_hid = APP_CLASS_ALL;
+static uint32_t s_ble_hid = APP_CLASS_ALL;
 static app_bt_mode_t s_bt_mode = APP_BT_BOTH;
 static uint32_t s_bt_audio = APP_BT_AUDIO_ALL;
 static uint16_t s_usb_vid; /* 0 = derive from the HID mode */
 static uint16_t s_usb_pid;
+/* Registered by app_ui_core at startup: the UI owns the pages, this component
+ * only relays the RPC. Never NULL once the UI started. */
+static const app_cfg_layout_rpc_t *s_layout_rpc;
 
 static const struct {
     const char *name;
@@ -158,16 +163,59 @@ static void save_u32(const char *key, uint32_t value)
     nvs_close(handle);
 }
 
+/* Sony emulation replaces the generic gamepad, and the motion interface needs
+ * the endpoint Sony would take, so the two groups are mutually exclusive. */
+static uint32_t normalize_mask(uint32_t mask)
+{
+    mask &= APP_CLASS_USB_ALL;
+    const uint32_t emu = APP_CLASS_DS4 | APP_CLASS_DS5 | APP_CLASS_XBOX;
+    if ((mask & emu) != 0) {
+        /* Exactly one emulation may be active, and it replaces the generic
+         * gamepad and the motion interface (endpoint budget). */
+        uint32_t one = mask & emu;
+        one &= (~one + 1u); /* keep the lowest set bit */
+        mask = (mask & ~emu) | one;
+        mask &= ~(APP_CLASS_GAMEPAD | APP_CLASS_SENSOR);
+    } else {
+        mask &= ~emu;
+    }
+    return mask;
+}
+
 esp_err_t app_cfg_set_usb_hid(uint32_t mask)
 {
-    s_classes = mask & APP_CLASS_USB_ALL;
+    s_classes = normalize_mask(mask);
     save_u32(NVS_KEY_CLASSES, s_classes);
+    return ESP_OK;
+}
+
+uint32_t app_cfg_ble_hid(void)
+{
+    return s_ble_hid;
+}
+
+esp_err_t app_cfg_set_ble_hid(uint32_t mask)
+{
+    s_ble_hid = mask & APP_CLASS_BT_ALL;
+    save_u32("ble_hid", s_ble_hid);
+    return ESP_OK;
+}
+
+esp_err_t app_cfg_reset_all(void)
+{
+    (void)app_cfg_set_usb_hid(APP_CLASS_USB_DEFAULT);
+    (void)app_cfg_set_bt_hid(APP_CLASS_ALL);
+    (void)app_cfg_set_ble_hid(APP_CLASS_ALL);
+    (void)app_cfg_set_usb_audio(true);
+    (void)app_cfg_set_bt_audio(APP_BT_AUDIO_ALL);
+    save_u32("bt_mode", (uint32_t)APP_BT_BOTH);
+    s_bt_mode = APP_BT_BOTH;
     return ESP_OK;
 }
 
 esp_err_t app_cfg_set_bt_hid(uint32_t mask)
 {
-    s_bt_hid = mask & APP_CLASS_ALL;
+    s_bt_hid = mask & APP_CLASS_BT_ALL;
     save_u32("bt_hid", s_bt_hid);
     return ESP_OK;
 }
@@ -264,7 +312,10 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
                            app_cfg_usb_hid_mode_name(app_cfg_usb_screen_mode()),
                            (unsigned)s_usb_vid, (unsigned)s_usb_pid, (int)s_usb_audio,
                            (unsigned)s_bt_hid, app_cfg_bt_mode_name(s_bt_mode),
-                           (unsigned)s_bt_audio, app_ui_layout_name(app_ui_layout()));
+                           (unsigned)s_bt_audio,
+                           s_layout_rpc != NULL && s_layout_rpc->name != NULL
+                               ? s_layout_rpc->name()
+                               : "none");
         break;
     case 2: /* enable */
     case 3: { /* disable */
@@ -275,9 +326,9 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
             break;
         }
         if (request->method_id == 2) {
-            s_classes |= mask;
+            s_classes = normalize_mask(s_classes | mask);
         } else {
-            s_classes &= ~mask;
+            s_classes = normalize_mask(s_classes & ~mask);
         }
         save_classes();
         written = snprintf((char *)response, response_capacity,
@@ -285,15 +336,16 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
         break;
     }
     case 4: { /* layout */
-        const app_ui_layout_t layout = app_ui_layout_from_name(arg);
-        if (layout == APP_UI_LAYOUT_COUNT) {
+        const char *applied = (s_layout_rpc != NULL && s_layout_rpc->apply != NULL)
+                                  ? s_layout_rpc->apply(arg)
+                                  : NULL;
+        if (applied == NULL) {
             written = snprintf((char *)response, response_capacity,
                                "{\"error\":\"unknown layout\"}");
             break;
         }
-        app_ui_set_layout(layout);
         written = snprintf((char *)response, response_capacity,
-                           "{\"layout\":\"%s\"}", app_ui_layout_name(layout));
+                           "{\"layout\":\"%s\"}", applied);
         break;
     }
     case 5: /* reboot */
@@ -316,12 +368,21 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
                 mask = 0;
             }
             if (key[0] == 'u') {
-                s_classes = mask;
-                save_u32(NVS_KEY_CLASSES, mask);
+                s_classes = normalize_mask(mask);
+                save_u32(NVS_KEY_CLASSES, s_classes);
             } else {
                 s_bt_hid = mask;
                 save_u32("bt_hid", mask);
             }
+        } else if (strcmp(key, "ble_hid") == 0) {
+            uint32_t mask = (uint32_t)strtoul(value, NULL, 0) & APP_CLASS_ALL;
+            if (strcmp(value, "all") == 0) {
+                mask = APP_CLASS_ALL;
+            } else if (strcmp(value, "none") == 0) {
+                mask = 0;
+            }
+            (void)app_cfg_set_ble_hid(mask);
+            known = true;
         } else if (strcmp(key, "usb_vid") == 0 || strcmp(key, "usb_pid") == 0) {
             const uint32_t id = (uint32_t)strtoul(value, NULL, 0) & 0xFFFFu;
             if (key[4] == 'v') {
@@ -379,6 +440,12 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
                            app_cfg_bt_mode_name(s_bt_mode), (unsigned)s_bt_audio);
         break;
     }
+    case 9: { /* reset every setting: {"cmd":"reset"} */
+        (void)app_cfg_reset_all();
+        written = snprintf((char *)response, response_capacity,
+                           "{\"reset\":true,\"reboot_required\":true}");
+        break;
+    }
     case 8: { /* restart BLE advertising: {"cmd":"ble_adv"} */
         app_ble_hid_restart_advertising();
         written = snprintf((char *)response, response_capacity, "{\"advertising\":true}");
@@ -408,13 +475,16 @@ esp_err_t app_cfg_init(void)
     uint32_t value = 0;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
         if (nvs_get_u32(handle, NVS_KEY_CLASSES, &value) == ESP_OK) {
-            s_classes = value & APP_CLASS_USB_ALL;
+            s_classes = normalize_mask(value);
         }
         if (nvs_get_u32(handle, "usb_audio", &value) == ESP_OK) {
             s_usb_audio = value != 0;
         }
         if (nvs_get_u32(handle, "bt_hid", &value) == ESP_OK) {
-            s_bt_hid = value & APP_CLASS_ALL;
+            s_bt_hid = value & APP_CLASS_BT_ALL;
+        }
+        if (nvs_get_u32(handle, "ble_hid", &value) == ESP_OK) {
+            s_ble_hid = value & APP_CLASS_BT_ALL;
         }
         if (nvs_get_u32(handle, "bt_mode", &value) == ESP_OK && value <= APP_BT_BOTH) {
             s_bt_mode = (app_bt_mode_t)value;
@@ -445,12 +515,17 @@ static void rpc_task(void *arg)
     /* Iris must be fully started before its RPC registry accepts handlers; a
      * short delay also keeps a registry failure from blocking boot. */
     vTaskDelay(pdMS_TO_TICKS(1500));
-    for (uint16_t method = 1; method <= 8; ++method) {
+    for (uint16_t method = 1; method <= 9; ++method) {
         const esp_err_t err = esp_iris_rpc_register(APP_CFG_RPC_SERVICE, method,
                                                     rpc_handler, NULL);
         ESP_LOGI(TAG, "rpc %u: %s", (unsigned)method, esp_err_to_name(err));
     }
     vTaskDelete(NULL);
+}
+
+void app_cfg_set_layout_rpc(const app_cfg_layout_rpc_t *rpc)
+{
+    s_layout_rpc = rpc;
 }
 
 esp_err_t app_cfg_register_rpc(void)

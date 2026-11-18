@@ -2,20 +2,21 @@
 #pragma once
 
 #include "esp_err.h"
-#include "esp_gsp.h"
-#include "esp_lcd_touch.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Own the panel touch controller and route contacts by screen layout.
+/** Start the input device layer: open the CST9220 touch controller through the
+ * BSP, configure the BOOT key and publish app_input_event_t samples.
  *
- * GSP must be started without a touch handle (single reader). The task polls
- * at 16 ms, draws one circle per contact through the GSP overlay, switches
- * layouts on corner taps and feeds app_usb_core with gamepad/mouse/keyboard input.
- */
-esp_err_t app_ui_touch_start(esp_gsp_handle_t gsp, esp_lcd_touch_handle_t touch);
+ * The task polls every 16 ms and only reports hardware edges and motion; every
+ * page, gesture and HID decision belongs to app_ui_core. GSP must be started
+ * with touch = NULL so this is the single reader of the controller.
+ *
+ * Call once at boot after the display is initialized. Returns ESP_OK, an
+ * initialization error, or ESP_ERR_NO_MEM when the task cannot be created. */
+esp_err_t app_ui_touch_start(void);
 
 #ifdef __cplusplus
 }

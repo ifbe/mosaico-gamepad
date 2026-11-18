@@ -2,17 +2,23 @@
 
 #include "app_ui.h"
 
+#include "ui_internal.h"
+
 #include "app_cfg.h"
+#include "app_log.h"
+#include "app_ui_display.h"
+#include "esp_check.h"
+#include "esp_gsp_esp_lcd.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "app_log.h"
 
 #include <stddef.h>
 #include <string.h>
 
 #include "bundle_gsp.h"
+#include "ui_bundle.h"
 
 /* Marquee: one dot travelling around the bezel (dynamic GSP position). */
 #define MARQUEE_DOT_SIZE 12
@@ -21,6 +27,12 @@
 /* Terminal look follows the sibling ptt project: 15 px text, 22 px line pitch,
  * soft green on a near-black panel, 17 visible lines. */
 #define TERMINAL_LINES 30
+
+/* CO5300 QSPI requires both the X origin and width in multiples of 4 pixels.
+ * GSP defaults to no expansion; the BSP rounder only covers LVGL. */
+#define SCENE_ALIGN_PX 4
+
+static const char *TAG = "app_ui";
 
 static esp_gsp_err_t (*const s_term_set_text[TERMINAL_LINES])(esp_gsp_handle_t, const char *) = {
     gsp_gamepad_term_0_set_text,
@@ -55,8 +67,21 @@ static esp_gsp_err_t (*const s_term_set_text[TERMINAL_LINES])(esp_gsp_handle_t, 
     gsp_gamepad_term_29_set_text,
 };
 
+/* Chip label colours: the cyan fill needs dark text, an unselected chip keeps
+ * the light label. There is no third "blocked" look: a chip is either selected
+ * or not. */
+#define CHIP_TEXT_ON 0x101010u   /* on the cyan fill */
+#define CHIP_TEXT_OFF 0xE0E0E0u
+
+#define CHIP_ROWS 4
+#define CHIP_COLS 5
+
 struct app_ui {
     esp_gsp_handle_t gsp;
+    bool chip_on[CHIP_ROWS][CHIP_COLS];
+    uint8_t setter_errors;   /* failed setters in the current refresh */
+    uint8_t refresh_retries; /* bounded self-heal attempts */
+    bool refresh_pending;
     bool repaint_pending;
     bool marquee_parked;
     void *timer;
@@ -67,33 +92,92 @@ struct app_ui {
 
 static struct app_ui s_app;
 
+#define SETTER_LOGS_MAX 3
+
+/* GSP setters are queued to the render task and can be rejected while it is
+ * busy. Silence would leave a stale screen, so the first few failures are
+ * logged and the caller retries the whole refresh. */
 static void remember(esp_gsp_err_t err)
 {
-    if (err != ESP_GSP_OK) {
-        s_app.last_error = err;
+    if (err == ESP_GSP_OK) {
+        return;
     }
+    s_app.last_error = err;
+    ++s_app.setter_errors;
+    if (s_app.setter_errors <= SETTER_LOGS_MAX) {
+        ESP_LOGW(TAG, "GSP setter failed (0x%x)", err);
+    }
+}
+
+static bool chip_valid(unsigned row, unsigned index)
+{
+    return row < CHIP_ROWS && index < (row == 1 ? 3u : CHIP_COLS);
+}
+
+/* One place decides the label colour, so the two refresh paths cannot fight
+ * over it. */
+static void apply_chip_color(unsigned row, unsigned index)
+{
+    static const gsp_component_key_t text_key[CHIP_ROWS][CHIP_COLS] = {
+        {
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_USB_0, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_USB_1,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_USB_2, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_USB_3,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_USB_4,
+        },
+        {
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_MODE_0, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_MODE_1,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_MODE_2, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_MODE_2,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_MODE_2,
+        },
+        {
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BT_0, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BT_1,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BT_2, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BT_3,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BT_4,
+        },
+        {
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BLE_0, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BLE_1,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BLE_2, GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BLE_3,
+            GSP_GAMEPAD_OBJ_KEY_CHIP_TEXT_BLE_4,
+        },
+    };
+    if (s_app.gsp == NULL || !chip_valid(row, index)) {
+        return;
+    }
+    const uint32_t color = s_app.chip_on[row][index] ? CHIP_TEXT_ON : CHIP_TEXT_OFF;
+    remember(esp_gsp_component_set_color_rgb888(s_app.gsp, text_key[row][index], color));
 }
 
 void app_ui_set_chip(unsigned row, unsigned index, bool on)
 {
-    if (row > 1 || index > 4 || s_app.gsp == NULL) {
+    if (s_app.gsp == NULL) {
         return;
     }
     static esp_gsp_err_t (*const usb[5])(esp_gsp_handle_t, bool) = {
-        gsp_gamepad_chip_on_usb_0_set_visible,
-        gsp_gamepad_chip_on_usb_1_set_visible,
-        gsp_gamepad_chip_on_usb_2_set_visible,
-        gsp_gamepad_chip_on_usb_3_set_visible,
+        gsp_gamepad_chip_on_usb_0_set_visible, gsp_gamepad_chip_on_usb_1_set_visible,
+        gsp_gamepad_chip_on_usb_2_set_visible, gsp_gamepad_chip_on_usb_3_set_visible,
         gsp_gamepad_chip_on_usb_4_set_visible,
     };
+    static esp_gsp_err_t (*const mode[3])(esp_gsp_handle_t, bool) = {
+        gsp_gamepad_chip_on_mode_0_set_visible, gsp_gamepad_chip_on_mode_1_set_visible,
+        gsp_gamepad_chip_on_mode_2_set_visible,
+    };
     static esp_gsp_err_t (*const bt[5])(esp_gsp_handle_t, bool) = {
-        gsp_gamepad_chip_on_bt_0_set_visible,
-        gsp_gamepad_chip_on_bt_1_set_visible,
-        gsp_gamepad_chip_on_bt_2_set_visible,
-        gsp_gamepad_chip_on_bt_3_set_visible,
+        gsp_gamepad_chip_on_bt_0_set_visible, gsp_gamepad_chip_on_bt_1_set_visible,
+        gsp_gamepad_chip_on_bt_2_set_visible, gsp_gamepad_chip_on_bt_3_set_visible,
         gsp_gamepad_chip_on_bt_4_set_visible,
     };
-    remember((row == 0 ? usb : bt)[index](s_app.gsp, on));
+    static esp_gsp_err_t (*const ble[5])(esp_gsp_handle_t, bool) = {
+        gsp_gamepad_chip_on_ble_0_set_visible, gsp_gamepad_chip_on_ble_1_set_visible,
+        gsp_gamepad_chip_on_ble_2_set_visible, gsp_gamepad_chip_on_ble_3_set_visible,
+        gsp_gamepad_chip_on_ble_4_set_visible,
+    };
+    if (!chip_valid(row, index)) {
+        return;
+    }
+    s_app.chip_on[row][index] = on;
+    remember((row == 0 ? usb : (row == 1 ? mode : (row == 2 ? bt : ble)))[index](
+                 s_app.gsp, on));
+    apply_chip_color(row, index);
 }
 
 void app_ui_refresh_chips(void)
@@ -101,19 +185,38 @@ void app_ui_refresh_chips(void)
     if (s_app.gsp == NULL) {
         return;
     }
+    s_app.setter_errors = 0;
     const uint32_t usb = app_cfg_classes();
     const uint32_t bt = app_cfg_bt_hid();
+    const uint32_t ble = app_cfg_ble_hid();
     const uint32_t bt_audio = app_cfg_bt_audio();
+
     app_ui_set_chip(0, 0, (usb & APP_CLASS_KEYBOARD) != 0);
     app_ui_set_chip(0, 1, (usb & APP_CLASS_MOUSE) != 0);
     app_ui_set_chip(0, 2, (usb & APP_CLASS_GAMEPAD) != 0);
-    app_ui_set_chip(0, 3, (usb & (APP_CLASS_DS4 | APP_CLASS_DS5)) != 0);
+    app_ui_set_chip(0, 3, (usb & APP_CLASS_SENSOR) != 0);
     app_ui_set_chip(0, 4, app_cfg_usb_audio());
-    app_ui_set_chip(1, 0, (bt & APP_CLASS_KEYBOARD) != 0);
-    app_ui_set_chip(1, 1, (bt & APP_CLASS_MOUSE) != 0);
-    app_ui_set_chip(1, 2, (bt & APP_CLASS_GAMEPAD) != 0);
-    app_ui_set_chip(1, 3, false); /* the Bluetooth row has no Sony slot */
-    app_ui_set_chip(1, 4, bt_audio != 0);
+
+    app_ui_set_chip(1, 0, (usb & APP_CLASS_DS4) != 0);
+    app_ui_set_chip(1, 1, (usb & APP_CLASS_DS5) != 0);
+    app_ui_set_chip(1, 2, (usb & APP_CLASS_XBOX) != 0);
+
+    app_ui_set_chip(2, 0, (bt & APP_CLASS_KEYBOARD) != 0);
+    app_ui_set_chip(2, 1, (bt & APP_CLASS_MOUSE) != 0);
+    app_ui_set_chip(2, 2, (bt & APP_CLASS_GAMEPAD) != 0);
+    app_ui_set_chip(2, 3, (bt & APP_CLASS_SENSOR) != 0);
+    app_ui_set_chip(2, 4, bt_audio != 0);
+
+    app_ui_set_chip(3, 0, (ble & APP_CLASS_KEYBOARD) != 0);
+    app_ui_set_chip(3, 1, (ble & APP_CLASS_MOUSE) != 0);
+    app_ui_set_chip(3, 2, (ble & APP_CLASS_GAMEPAD) != 0);
+    app_ui_set_chip(3, 3, (ble & APP_CLASS_SENSOR) != 0);
+    app_ui_set_chip(3, 4, false); /* reserved: LE Audio not implemented */
+
+    if (s_app.setter_errors != 0 && s_app.refresh_retries < 3) {
+        ++s_app.refresh_retries;
+        s_app.refresh_pending = true;
+    }
 }
 
 void app_ui_set_button_glow(unsigned button, bool on)
@@ -125,6 +228,20 @@ void app_ui_set_button_glow(unsigned button, bool on)
         gsp_gamepad_glow_y_set_visible,
     };
     if (button >= 4 || s_app.gsp == NULL) {
+        return;
+    }
+    remember(setters[button](s_app.gsp, on));
+}
+
+void app_ui_set_side_glow(app_ui_side_t button, bool on)
+{
+    static esp_gsp_err_t (*const setters[APP_UI_SIDE_COUNT])(esp_gsp_handle_t, bool) = {
+        gsp_gamepad_gp_glow_lb_set_visible,   gsp_gamepad_gp_glow_rb_set_visible,
+        gsp_gamepad_gp_glow_ls_set_visible,   gsp_gamepad_gp_glow_rs_set_visible,
+        gsp_gamepad_gp_glow_sel_set_visible,  gsp_gamepad_gp_glow_start_set_visible,
+        gsp_gamepad_gp_glow_lt_set_visible,   gsp_gamepad_gp_glow_rt_set_visible,
+    };
+    if (button >= APP_UI_SIDE_COUNT || s_app.gsp == NULL) {
         return;
     }
     remember(setters[button](s_app.gsp, on));
@@ -207,6 +324,11 @@ void app_ui_set_layout(app_ui_layout_t layout)
     }
 }
 
+esp_gsp_handle_t app_ui_handle(void)
+{
+    return s_app.gsp;
+}
+
 static void place_marquee(int32_t pos)
 {
     const int32_t span = 480 - MARQUEE_DOT_SIZE;
@@ -265,6 +387,10 @@ static void marquee_tick(esp_gsp_handle_t gsp, void *user_ctx)
     static unsigned tick;
     static uint32_t heap_log_ms;
     static bool blanked;
+    if (s_app.refresh_pending) {
+        s_app.refresh_pending = false;
+        app_ui_refresh_chips();
+    }
     if (++tick % TERMINAL_TICK_DIV == 0) {
         refresh_terminal();
     }
@@ -315,18 +441,84 @@ static void marquee_tick(esp_gsp_handle_t gsp, void *user_ctx)
     place_marquee(s_app.marquee_pos);
 }
 
-esp_err_t app_ui_start(esp_gsp_handle_t gsp)
+/* The layout RPC lives in app_cfg (configuration transport); the UI registers
+ * these two hooks so app_cfg never depends on this component. */
+static const char *layout_hook_name(void)
 {
-    if (gsp == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    return app_ui_layout_name(app_ui_layout());
+}
+
+static const char *layout_hook_apply(const char *name)
+{
+    const app_ui_layout_t layout = app_ui_layout_from_name(name);
+    if (layout == APP_UI_LAYOUT_COUNT) {
+        return NULL;
     }
+    app_ui_set_layout(layout);
+    return app_ui_layout_name(layout);
+}
+
+static const app_cfg_layout_rpc_t s_layout_rpc = {
+    .name = layout_hook_name,
+    .apply = layout_hook_apply,
+};
+
+/* Runs on the render task before the first frame: registrations and setters
+ * here cannot race the initial compose. This is why the overlay contributor is
+ * installed here instead of from app_main (it used to time out). */
+static void ui_prepare(esp_gsp_handle_t gsp, void *ctx)
+{
+    (void)ctx;
     s_app.gsp = gsp;
-    s_app.last_error = ESP_GSP_OK;
     s_app.layout = APP_UI_LAYOUT_BLANK;
     s_app.marquee_pos = 0;
     place_marquee(0);
     app_ui_set_layout(APP_UI_LAYOUT_BLANK);
-
+    /* The settings chips are pushed from the first timer tick: issuing ~40
+     * setters before the first frame competes with the initial compose and a
+     * rejected setter would leave a chip stuck. */
+    s_app.refresh_pending = true;
+    app_ui_input_attach_overlay(gsp);
     s_app.timer = esp_gsp_timer_create(gsp, MARQUEE_TICK_MS, marquee_tick, NULL);
-    return s_app.timer == NULL ? ESP_ERR_NO_MEM : ESP_OK;
+    if (s_app.timer == NULL) {
+        ESP_LOGE(TAG, "UI timer unavailable");
+    }
+}
+
+esp_err_t app_ui_start(void)
+{
+    app_cfg_set_layout_rpc(&s_layout_rpc);
+
+    esp_gsp_config_t config;
+    ESP_RETURN_ON_ERROR(ui_bundle_open(&config), TAG, "UI bundle");
+
+    esp_gsp_esp_lcd_config_t lcd = ESP_GSP_ESP_LCD_CONFIG_INIT();
+    ESP_RETURN_ON_ERROR(app_ui_display_init(&lcd.display), TAG, "display");
+    /* GSP must not poll the controller: app_ui_touch is the single reader. */
+    lcd.touch = NULL;
+    lcd.task_stack_psram = true; /* keep internal RAM for the BT controller */
+    lcd.render_alignment = (esp_display_present_render_alignment_t){
+        .x_pixels = SCENE_ALIGN_PX,
+        .width_pixels = SCENE_ALIGN_PX,
+    };
+
+    s_app.last_error = ESP_GSP_OK;
+    const esp_err_t err = esp_gsp_esp_lcd_start_prepared(&config, &lcd, ui_prepare, NULL,
+                                                        &s_app.gsp);
+    if (s_app.gsp == NULL || s_app.timer == NULL) {
+        return err != ESP_OK ? err : ESP_ERR_INVALID_STATE;
+    }
+    if (err != ESP_OK) {
+        /* The render task reported a first-frame failure; the scene is still
+         * installed and later frames may succeed. */
+        ESP_LOGW(TAG, "first frame failed (0x%x); continuing", err);
+    }
+
+    /* Input is the last layer: the scene exists, so events have somewhere to
+     * land. A missing touch controller leaves the screens working. */
+    const esp_err_t input_err = app_ui_input_start();
+    if (input_err != ESP_OK) {
+        ESP_LOGE(TAG, "input unavailable: %s", esp_err_to_name(input_err));
+    }
+    return ESP_OK;
 }

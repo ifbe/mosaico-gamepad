@@ -10,6 +10,7 @@
 #include "esp_check.h"
 #include "esp_gap_ble_api.h"
 #include "esp_hidd_gatts.h"
+#include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_hidd.h"
 #include "esp_log.h"
@@ -284,6 +285,17 @@ void app_ble_hid_send(uint8_t report_id, const uint8_t *data, size_t len)
 {
     if (!app_ble_hid_connected() || data == NULL) {
         return;
+    }
+    /* A 17-18 byte sensor report fits the default 20-byte notification payload,
+     * but the phone negotiates a 30 ms connection interval, so at most one
+     * motion notification per interval is worth sending. */
+    if (report_id == 4) {
+        static int64_t last_us;
+        const int64_t now = esp_timer_get_time();
+        if (last_us != 0 && now - last_us < 30000) {
+            return;
+        }
+        last_us = now;
     }
     /* esp_hid sizes each Report characteristic from the report map
      * (input_len / 8, without the report ID) and announces the ID through the

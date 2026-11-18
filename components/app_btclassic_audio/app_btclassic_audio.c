@@ -19,6 +19,7 @@
 #include "esp_gap_bt_api.h"
 #include "esp_hf_client_api.h"
 #include "esp_hf_client_legacy_api.h" /* esp_hf_client_outgoing_data_ready() */
+#include "esp_timer.h"
 #include "esp_pbac_api.h"
 
 #endif /* CONFIG_BT_ENABLED */
@@ -29,7 +30,9 @@ static const char *TAG = "bt_classic";
 
 /* Mono <-> stereo scratch space. SCO audio is mono, the ES8311 runs stereo. */
 #define HFP_FRAMES 160 /* 10 ms at 16 kHz */
-#define MIC_READ_FRAMES (HFP_FRAMES * 3) /* 10 ms at 48 kHz */
+#define MIC_READ_FRAMES (HFP_FRAMES * 3) /* 10 ms at 48 kHz: the I2S read
+                                          * granularity the codec is built around;
+                                          * shorter chunks returned nothing. */
 static int16_t s_hfp_stereo[HFP_FRAMES * 6 * 2]; /* SCO 8/16 kHz -> 48 kHz */
 static int16_t s_hfp_mono[HFP_FRAMES];
 
@@ -37,6 +40,7 @@ static bool s_started;
 static bool s_connected;      /* A2DP link */
 static bool s_paired;
 static int s_hfp_state = -1;   /* esp_hf_client_connection_state_t */
+static esp_timer_handle_t s_link_timer; /* keeps the ACL link out of sniff */
 /* Cumulative counters: a single status line then tells the whole story. */
 static int s_sco_attempts;
 static int s_sco_ok;
@@ -229,6 +233,12 @@ static uint32_t hfp_legacy_send(uint8_t *buf, uint32_t len)
     return n;
 }
 
+/* Forces the ACL link back to active mode; defined below with the explanation
+ * of why a project-side call is needed at all. */
+static void force_link_active(void);
+static void link_active_timer_start(void);
+static void link_active_timer_stop(void);
+
 static void hfp_mic_task(void *arg)
 {
     (void)arg;
@@ -262,6 +272,30 @@ static void hfp_mic_task(void *arg)
         }
         ++s_mic_iters;
         s_mic_bytes += (uint32_t)(out * 2);
+        {
+            static uint32_t rate_ms, rate_iters, rate_bytes;
+            static int32_t rate_amp;
+            const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            ++rate_iters;
+            rate_bytes += (uint32_t)(out * 2);
+            for (size_t i = 0; i < out; ++i) {
+                const int32_t v = s_hfp_mono[i] < 0 ? -(int32_t)s_hfp_mono[i]
+                                                    : (int32_t)s_hfp_mono[i];
+                if (v > rate_amp) {
+                    rate_amp = v;
+                }
+            }
+            if (now_ms - rate_ms >= 5000) {
+                const uint32_t dt = now_ms - rate_ms;
+                ESP_LOGI(TAG, "mic rate: %u iters/s, %u B/s, amp=%d",
+                         (unsigned)(rate_iters * 1000 / dt),
+                         (unsigned)(rate_bytes * 1000 / dt), (int)rate_amp);
+                rate_ms = now_ms;
+                rate_iters = 0;
+                rate_bytes = 0;
+                rate_amp = 0;
+            }
+        }
         const uint32_t level = s_sco_up_head - s_sco_up_tail;
         if (level > s_ring_peak) {
             s_ring_peak = level;
@@ -325,6 +359,33 @@ static void hfp_audio_data_cb(esp_hf_sync_conn_hdl_t handle, esp_hf_audio_buff_t
     esp_hf_client_audio_buff_free(audio_buf);
 }
 
+/* Bluedroid's own power management puts the ACL link into sniff, and the
+ * controller then refuses the eSCO setup that carries call audio (log:
+ * "OLM_CONN: pend list full on link:0, refuse proc_type:0x800d"), so the call
+ * connects but no voice flows. There is no Kconfig and no public API to change
+ * that policy, but the BTA power manager exports bta_dm_pm_active(), which
+ * forces the link back to active mode. It has no public header, so declare it
+ * here; see docs/gotcha.md section 4.3. */
+extern void bta_dm_pm_active(uint8_t peer_addr[6]);
+
+static void force_link_active(void)
+{
+    const int bonded = esp_bt_gap_get_bond_device_num();
+    if (bonded <= 0) {
+        return;
+    }
+    esp_bd_addr_t peers[4];
+    int count = bonded < (int)(sizeof(peers) / sizeof(peers[0]))
+                    ? bonded
+                    : (int)(sizeof(peers) / sizeof(peers[0]));
+    if (esp_bt_gap_get_bond_device_list(&count, peers) != ESP_OK) {
+        return;
+    }
+    for (int i = 0; i < count; ++i) {
+        bta_dm_pm_active(peers[i]);
+    }
+}
+
 static void hfp_sco_start(void)
 {
     if (s_sco_active) {
@@ -341,8 +402,23 @@ static void hfp_sco_start(void)
         app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
         return;
     }
+    /* Prime the uplink ring with ~20 ms of silence. Without it the ring only
+     * ever holds one production chunk (measured peak 160 B), the stack's
+     * 120-byte pulls regularly find less and re-request immediately, and the
+     * phone ends up with only two thirds of the audio it asked for. */
+    s_sco_up_head = 0;
+    s_sco_up_tail = 0;
+    {
+        const uint32_t rate = s_sco_rate != 0 ? s_sco_rate : 8000;
+        const uint32_t prime = rate / 50; /* 20 ms */
+        memset(s_sco_up, 0, prime < SCO_UP_BYTES ? prime : SCO_UP_BYTES);
+        s_sco_up_head = prime < SCO_UP_BYTES ? prime : SCO_UP_BYTES;
+    }
     s_sco_active = true;
-    if (xTaskCreatePinnedToCore(hfp_mic_task, "bt_mic", 4096, NULL, 3, NULL, 0) != pdPASS) {
+    /* The uplink producer must outrank the UI/render tasks: it wakes on the I2S
+     * DMA and any delay drops microphone samples, which shows up as the phone
+     * receiving fewer bytes per pull than it asks for. */
+    if (xTaskCreatePinnedToCore(hfp_mic_task, "bt_mic", 4096, NULL, 5, NULL, 0) != pdPASS) {
         s_sco_active = false;
         app_audio_codec_mic_consumer_remove(&s_sco_mic);
         app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
@@ -402,15 +478,22 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
          * silent. */
         if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
             memcpy(s_hfp_peer, param->conn_stat.remote_bda, sizeof(s_hfp_peer));
+            /* Keep this link out of sniff for as long as it is up: the eSCO
+             * setup at call time is refused otherwise. */
+            link_active_timer_start();
             ESP_LOGI(TAG, "hfp ready (SCO is opened when a call is active)");
         } else if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
+            link_active_timer_stop();
             hfp_sco_stop();
         }
         break;
     case ESP_HF_CLIENT_RING_IND_EVT:
         ESP_LOGI(TAG, "hfp ringing");
-        /* A call is being set up: now the AG accepts an audio connection. */
+        /* A call is being set up: now the AG accepts an audio connection.
+         * Take the ACL link out of sniff first, otherwise the controller
+         * refuses the eSCO setup and the call starts without voice. */
         if (!s_sco_active) {
+            force_link_active();
             const esp_err_t aerr = esp_hf_client_connect_audio(s_hfp_peer);
             ESP_LOGI(TAG, "ringing, requesting SCO: %s", esp_err_to_name(aerr));
         }
@@ -419,6 +502,7 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
         s_call_status = (int)param->call.status;
         ESP_LOGI(TAG, "hfp call status %d", param->call.status);
         if (param->call.status != 0 && !s_sco_active) {
+            force_link_active();
             const esp_err_t aerr = esp_hf_client_connect_audio(s_hfp_peer);
             ESP_LOGI(TAG, "call active, requesting SCO: %s", esp_err_to_name(aerr));
         }
@@ -431,15 +515,21 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
         break;
     case ESP_HF_CLIENT_AUDIO_STATE_EVT: {
         const esp_hf_client_audio_state_t state = param->audio_stat.state;
-        ESP_LOGI(TAG, "hfp audio state %d", state);
+        ESP_LOGI(TAG, "hfp audio state %d handle=%u codec=%u", state,
+                 (unsigned)param->audio_stat.sync_conn_handle, (unsigned)s_sco_rate);
         if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTING) {
+            /* Get the ACL link out of sniff before the controller tries to set
+             * up the eSCO link; otherwise the request is refused. */
+            force_link_active();
             ++s_sco_attempts;
         } else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED) {
             s_sco_rate = 8000; /* CVSD */
             ++s_sco_ok;
+            force_link_active();
         } else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC) {
             s_sco_rate = 16000; /* mSBC wideband */
             ++s_sco_ok;
+            force_link_active();
         }
         if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED ||
             state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC) {
@@ -480,6 +570,49 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         break;
     default:
         break;
+    }
+}
+
+/* Bluedroid keeps asking for sniff on this link (the headset power spec even
+ * requests it while a SCO call is up), and the controller then refuses the eSCO
+ * setup, so calls start without voice until a later retry. Stop the link from
+ * sitting in sniff at all: while HFP is connected, poke the BTA power manager
+ * once a second. */
+#define LINK_ACTIVE_PERIOD_US (1000 * 1000)
+
+static void link_active_timer_cb(void *arg)
+{
+    (void)arg;
+    if (s_hfp_state == (int)ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED) {
+        force_link_active();
+    }
+}
+
+static void link_active_timer_start(void)
+{
+    if (s_link_timer != NULL) {
+        return;
+    }
+    const esp_timer_create_args_t args = {
+        .callback = link_active_timer_cb,
+        .name = "link_active",
+    };
+    if (esp_timer_create(&args, &s_link_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "link-active timer unavailable");
+        return;
+    }
+    if (esp_timer_start_periodic(s_link_timer, LINK_ACTIVE_PERIOD_US) != ESP_OK) {
+        (void)esp_timer_delete(s_link_timer);
+        s_link_timer = NULL;
+    }
+}
+
+static void link_active_timer_stop(void)
+{
+    if (s_link_timer != NULL) {
+        (void)esp_timer_stop(s_link_timer);
+        (void)esp_timer_delete(s_link_timer);
+        s_link_timer = NULL;
     }
 }
 
@@ -531,6 +664,7 @@ void app_btclassic_audio_stop(void)
     if (!s_started) {
         return;
     }
+    link_active_timer_stop();
     hfp_sco_stop();
     a2dp_stop_streaming();
     esp_hf_client_deinit();

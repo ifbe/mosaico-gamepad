@@ -11,7 +11,7 @@ CONFIG_ESP_IRIS_MAX_RPC_HANDLERS=16
 # one UAC2 audio function registered through the extra-interface hook).
 # ESP-Iris reserves the HID interface only when this count is non-zero.
 CONFIG_TINYUSB_CDC_COUNT=2
-CONFIG_TINYUSB_HID_COUNT=3
+CONFIG_TINYUSB_HID_COUNT=4
 
 # The USB audio path writes one 1 ms block per codec write and the isochronous
 # tasks sleep in tick units; a 100 Hz tick would round those to 10 ms and drop

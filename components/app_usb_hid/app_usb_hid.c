@@ -2,6 +2,8 @@
 
 #include "app_usb_hid.h"
 
+#include "app_sensor.h"
+
 #include <stdatomic.h>
 #include <string.h>
 
@@ -22,9 +24,11 @@ static const uint8_t s_desc_gp[] = {
     /* 16 buttons */
     0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
     0x95, 0x10, 0x81, 0x02,
-    /* left stick X/Y, right stick Rx/Ry (0..255, centre 128) */
+    /* left stick X/Y, right stick Rx/Ry (0..255, centre 128),
+     * analog triggers Z (LT) and Rz (RT), 0 = released */
     0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34,
-    0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+    0x09, 0x32, 0x09, 0x35,
+    0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02,
     0xC0,
 };
 
@@ -38,6 +42,37 @@ static const uint8_t s_desc_mouse[] = {
     0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
     0x95, 0x01, 0x81, 0x06,
     0xC0, 0xC0,
+};
+
+
+/* Motion interface, HID Sensors page (0x20) as defined by "HID Sensor Usages":
+ * Accelerometer 3D (0x73) / Gyrometer 3D (0x76) / Compass 3D (0x83), each in its
+ * own physical collection with the X/Y/Z data usages (0x453..0x455,
+ * 0x457..0x459, 0x485..0x487). The three sensors share report ID 4 so the
+ * 18-byte wire format is unchanged; values keep the device scaling (mg,
+ * 0.1 dps, 0.1 uT) because no Unit/Unit Exponent properties are exported. */
+static const uint8_t s_desc_sensor[] = {
+    0x05, 0x20,                   /* Usage Page (Sensors) */
+    0x85, 0x04,                   /* Report ID (4) */
+    0x16, 0x00, 0x80,             /* Logical Minimum (-32768) */
+    0x26, 0xFF, 0x7F,             /* Logical Maximum (32767) */
+    0x75, 0x10,                   /* Report Size (16) */
+    0x95, 0x03,                   /* Report Count (3) */
+
+    0x09, 0x73, 0xA1, 0x00,       /* Usage (Accelerometer 3D), Collection (Physical) */
+    0x09, 0x53, 0x09, 0x54, 0x09, 0x55, /* Acceleration X/Y/Z Axis */
+    0x81, 0x02,                   /* Input (Data,Var,Abs) */
+    0xC0,                         /* End Collection */
+
+    0x09, 0x76, 0xA1, 0x00,       /* Usage (Gyrometer 3D), Collection (Physical) */
+    0x09, 0x57, 0x09, 0x58, 0x09, 0x59, /* Angular Velocity X/Y/Z Axis */
+    0x81, 0x02,
+    0xC0,
+
+    0x09, 0x83, 0xA1, 0x00,       /* Usage (Compass 3D), Collection (Physical) */
+    0x09, 0x85, 0x09, 0x86, 0x09, 0x87, /* Magnetic Flux X/Y/Z Axis */
+    0x81, 0x02,
+    0xC0,
 };
 
 static const uint8_t s_desc_kbd[] = {
@@ -63,6 +98,7 @@ static const uint8_t s_sony_desc[] = {
 };
 
 static uint8_t s_sony_instance = 0xFF;
+static uint8_t s_sensor_instance = 0xFF;
 static app_usb_hid_mode_t s_sony_mode = APP_USB_HID_GENERIC;
 static uint16_t s_sony_counter;
 
@@ -105,13 +141,33 @@ static void sony_report(uint8_t *out, uint16_t buttons, const uint8_t sticks[4])
     }
     out[10] = (uint8_t)(s_sony_counter & 0xFF);
     out[11] = (uint8_t)(s_sony_counter >> 8);
+
+    /* Motion data, DS4 USB report 0x01 layout: gyro at 13..18, accel at
+     * 19..24, little-endian int16. Our units are 0.1 dps and mg; DS4 expects
+     * roughly 1024 LSB per 90 dps and 8192 LSB per g, so scale accordingly.
+     * A real calibration (feature report 0x05) is not provided. */
+    app_sensor_sample_t motion;
+    if (app_sensor_read(&motion)) {
+        for (unsigned i = 0; i < 3; ++i) {
+            const int32_t gyro = (int32_t)motion.gyro[i] * 114 / 1000; /* 0.1dps -> raw */
+            const int32_t accel = (int32_t)motion.accel[i] * 8192 / 1000; /* mg -> raw */
+            const uint16_t g = (uint16_t)(int16_t)gyro;
+            const uint16_t a = (uint16_t)(int16_t)accel;
+            out[13 + i * 2] = (uint8_t)(g & 0xFF);
+            out[14 + i * 2] = (uint8_t)(g >> 8);
+            out[19 + i * 2] = (uint8_t)(a & 0xFF);
+            out[20 + i * 2] = (uint8_t)(a >> 8);
+        }
+    }
 }
 
 #define HID_REPORT_GAMEPAD 1
 #define HID_REPORT_MOUSE 2
 #define HID_REPORT_KEYBOARD 3
+#define HID_REPORT_SENSOR 4
+#define SENSOR_REPORT_LEN 18
 
-#define GAMEPAD_REPORT_LEN 6
+#define GAMEPAD_REPORT_LEN 8
 #define MOUSE_REPORT_LEN 5
 #define KEYBOARD_REPORT_LEN 8
 
@@ -122,7 +178,6 @@ static void sony_report(uint8_t *out, uint16_t buttons, const uint8_t sticks[4])
  * second tick (~62 Hz) and keep the gamepad/keyboard at the full rate. */
 #define MOUSE_EVERY_TICKS 2
 #define KEEPALIVE_MS 250
-#define APP_HID_AI_BUTTON_GPIO GPIO_NUM_7
 #define TOUCH_MAX_COORD 1023
 #define UI_SIZE_PX 480
 #define USB_LAST_IN_EP 0x87
@@ -139,6 +194,7 @@ static struct {
 static atomic_int s_buttons;
 static atomic_int s_stick_lx = 128, s_stick_ly = 128;
 static atomic_int s_stick_rx = 128, s_stick_ry = 128;
+static atomic_int s_trigger_l, s_trigger_r;
 static atomic_int s_mouse_buttons;
 static atomic_int s_mouse_dx;
 static atomic_int s_mouse_dy;
@@ -162,13 +218,25 @@ static const struct {
 };
 #define INTERFACE_COUNT (sizeof(s_interfaces) / sizeof(s_interfaces[0]))
 
-/* TinyUSB asks for the report descriptor per HID instance. */
+/* TinyUSB asks for the report descriptor per HID instance.
+ *
+ * Every registered instance must be answered: TinyUSB's GET_DESCRIPTOR(HID
+ * REPORT) path hands this pointer straight to the control transfer without a
+ * NULL check, so returning NULL for the Sony or motion interface copies from a
+ * null pointer, panics and takes every other USB function (UAC2, the ESP-Iris
+ * console) down with it. */
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
     for (size_t i = 0; i < INTERFACE_COUNT; ++i) {
         if (s_usb.instance[i] == instance) {
             return s_interfaces[i].desc;
         }
+    }
+    if (instance != 0xFF && instance == s_sensor_instance) {
+        return s_desc_sensor;
+    }
+    if (instance != 0xFF && instance == s_sony_instance) {
+        return s_sony_desc;
     }
     return NULL;
 }
@@ -198,6 +266,14 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 bool app_usb_hid_usb_connected(void)
 {
     return tud_mounted();
+}
+
+const uint8_t *app_usb_hid_sensor_desc(size_t *len)
+{
+    if (len != NULL) {
+        *len = sizeof(s_desc_sensor);
+    }
+    return s_desc_sensor;
 }
 
 size_t app_usb_hid_class_count(void)
@@ -242,6 +318,12 @@ static void bt_send(uint8_t report_id, const uint8_t *data, size_t len)
 void app_usb_hid_set_buttons(uint16_t mask)
 {
     atomic_store(&s_buttons, mask);
+}
+
+void app_usb_hid_set_triggers(uint8_t lt, uint8_t rt)
+{
+    atomic_store(&s_trigger_l, lt);
+    atomic_store(&s_trigger_r, rt);
 }
 
 void app_usb_hid_set_sticks(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry)
@@ -311,21 +393,21 @@ static void hid_task(void *arg)
     int usb_sent_x = 0, usb_sent_y = 0, usb_sent_w = 0, usb_sent_p = 0;
     int bt_sent_x = 0, bt_sent_y = 0, bt_sent_w = 0, bt_sent_p = 0;
     uint8_t usb_buttons = 0, bt_buttons = 0;
+    uint8_t last_lt = 0, last_rt = 0;
     unsigned idle = 0;
     unsigned mouse_tick = 0;
     const unsigned keepalive_ticks = KEEPALIVE_MS / REPORT_PERIOD_MS;
 
     for (;;) {
-        uint16_t buttons = (uint16_t)atomic_load(&s_buttons);
-        if (gpio_get_level(APP_HID_AI_BUTTON_GPIO) == 0) {
-            buttons |= 1u << 8; /* button 9 */
-        }
+        const uint16_t buttons = (uint16_t)atomic_load(&s_buttons);
         gamepad[0] = (uint8_t)(buttons & 0xFF);
         gamepad[1] = (uint8_t)(buttons >> 8);
         gamepad[2] = (uint8_t)atomic_load(&s_stick_lx);
         gamepad[3] = (uint8_t)atomic_load(&s_stick_ly);
         gamepad[4] = (uint8_t)atomic_load(&s_stick_rx);
         gamepad[5] = (uint8_t)atomic_load(&s_stick_ry);
+        gamepad[6] = (uint8_t)atomic_load(&s_trigger_l);
+        gamepad[7] = (uint8_t)atomic_load(&s_trigger_r);
 
         /* Layout is [modifier][reserved][6 keys]: the descriptor reserves the
          * second byte, so the keycodes start at index 2. */
@@ -361,6 +443,14 @@ static void hid_task(void *arg)
         const int total_p = atomic_load(&s_mouse_pan);
         const uint8_t mouse_buttons_now = (uint8_t)atomic_load(&s_mouse_buttons);
         ++mouse_tick;
+
+        /* Report-side edge log: proves what actually leaves the device, which
+         * is what a host-side "-1 stuck" report has to be compared against. */
+        if (gamepad[6] != last_lt || gamepad[7] != last_rt) {
+            last_lt = gamepad[6];
+            last_rt = gamepad[7];
+            ESP_LOGI(TAG, "gamepad report LT=%u RT=%u", last_lt, last_rt);
+        }
 
         /* ---- USB ---------------------------------------------------- */
         if (usb) {
@@ -420,6 +510,23 @@ static void hid_task(void *arg)
             }
         }
 
+        if (s_sensor_instance != 0xFF && usb && (mouse_tick % 2) == 0 &&
+            tud_hid_n_ready(s_sensor_instance)) {
+            app_sensor_sample_t smp;
+            if (app_sensor_read(&smp)) {
+                int16_t values[9] = {
+                    smp.accel[0], smp.accel[1], smp.accel[2],
+                    smp.gyro[0], smp.gyro[1], smp.gyro[2],
+                    smp.mag[0], smp.mag[1], smp.mag[2],
+                };
+                (void)tud_hid_n_report(s_sensor_instance, HID_REPORT_SENSOR,
+                                       values, SENSOR_REPORT_LEN);
+                if (((app_cfg_bt_hid() | app_cfg_ble_hid()) & APP_CLASS_SENSOR) != 0) {
+                    bt_send(HID_REPORT_SENSOR, (const uint8_t *)values, SENSOR_REPORT_LEN);
+                }
+            }
+        }
+
         if (s_sony_instance != 0xFF) {
             /* A DualShock/DualSense streams its input report continuously. */
             const uint8_t sticks[4] = {
@@ -445,7 +552,7 @@ esp_err_t app_usb_hid_register_usb(uint8_t first_ep_in)
     for (size_t i = 0; i < INTERFACE_COUNT; ++i) {
         s_usb.instance[i] = 0xFF;
     }
-    esp_iris_usb_hid_iface_t ifaces[INTERFACE_COUNT];
+    esp_iris_usb_hid_iface_t ifaces[INTERFACE_COUNT + 2]; /* + Sony + sensor */
     size_t n = 0;
     s_usb.report_map_len = 0;
     for (size_t i = 0; i < INTERFACE_COUNT; ++i) {
@@ -487,6 +594,23 @@ esp_err_t app_usb_hid_register_usb(uint8_t first_ep_in)
         }
     }
 
+    /* Motion interface. It shares the endpoint budget with Sony, and app_cfg
+     * keeps the two mutually exclusive, so one free slot is always enough. */
+    s_sensor_instance = 0xFF;
+    if ((app_cfg_classes() & APP_CLASS_SENSOR) != 0 &&
+        (unsigned)first_ep_in + n <= USB_LAST_IN_EP) {
+        ifaces[n] = (esp_iris_usb_hid_iface_t){
+            .report_desc = s_desc_sensor,
+            .report_desc_len = sizeof(s_desc_sensor),
+            .ep_in = (uint8_t)(first_ep_in + n),
+            /* The input report is report ID + 18 payload bytes. */
+            .ep_size = SENSOR_REPORT_LEN + 1,
+            .interval_ms = 8,
+        };
+        s_sensor_instance = (uint8_t)n;
+        ++n;
+    }
+
     s_usb.count = n;
     ESP_LOGI(TAG, "USB HID interfaces: %u (classes 0x%X, mode %s)", (unsigned)n,
              (unsigned)app_cfg_classes(), app_cfg_usb_hid_mode_name(s_sony_mode));
@@ -498,15 +622,6 @@ esp_err_t app_usb_hid_register_usb(uint8_t first_ep_in)
 
 esp_err_t app_usb_hid_start(void)
 {
-    const gpio_config_t ai = {
-        .pin_bit_mask = 1ULL << APP_HID_AI_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&ai), TAG, "AI button GPIO");
-
     if (xTaskCreate(hid_task, "usb_core", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

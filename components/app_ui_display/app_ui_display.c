@@ -7,17 +7,19 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
-static const char *TAG = "gsp_board";
+/* Device layer: bring up the CO5300 QSPI panel and describe it to the
+ * presenter. Touch, GSP and every application concern belong elsewhere. */
 
-static esp_err_t board_display_init(esp_display_present_target_config_t *out_target)
+static const char *TAG = "app_display";
+
+esp_err_t app_ui_display_init(esp_display_present_target_config_t *out_target)
 {
     ESP_RETURN_ON_FALSE(out_target != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "present target is null");
 
     const bsp_display_config_t config = BSP_DISPLAY_DEFAULT_CONFIG();
     esp_lcd_panel_handle_t panel = NULL;
-    ESP_RETURN_ON_ERROR(bsp_display_new(&config, &panel), TAG,
-                        "initialize CO5300");
+    ESP_RETURN_ON_ERROR(bsp_display_new(&config, &panel), TAG, "initialize CO5300");
     ESP_RETURN_ON_FALSE(panel != NULL && bsp_display_get_panel_io() != NULL,
                         ESP_ERR_INVALID_STATE, TAG, "panel/io missing");
 
@@ -53,37 +55,7 @@ static esp_err_t board_display_init(esp_display_present_target_config_t *out_tar
     te_mode = "on";
     te_gpio = BSP_LCD_TE;
 #endif
-    ESP_LOGI(TAG, "GSP present target %dx%d RGB565 TE=%s GPIO=%d",
+    ESP_LOGI(TAG, "present target %dx%d RGB565 TE=%s GPIO=%d",
              BSP_LCD_H_RES, BSP_LCD_V_RES, te_mode, te_gpio);
-    return ESP_OK;
-}
-
-static esp_err_t board_touch_init(esp_lcd_touch_handle_t *out_touch)
-{
-    ESP_RETURN_ON_FALSE(out_touch != NULL, ESP_ERR_INVALID_ARG, TAG,
-                        "touch output is null");
-    const esp_err_t err = bsp_touch_new(BSP_LCD_ROTATION_DEFAULT, out_touch);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "touch unavailable (%s); continuing without it",
-                 esp_err_to_name(err));
-        *out_touch = NULL;
-        return ESP_OK;
-    }
-    return ESP_OK;
-}
-
-esp_err_t app_ui_display_init(esp_gsp_esp_lcd_config_t *out_config)
-{
-    ESP_RETURN_ON_FALSE(out_config != NULL, ESP_ERR_INVALID_ARG, TAG, "output is null");
-    esp_gsp_esp_lcd_config_t config = ESP_GSP_ESP_LCD_CONFIG_INIT();
-    /* CO5300 QSPI requires both the X origin and width in multiples of 4 pixels.
-     * GSP defaults to no expansion; the BSP rounder only covers LVGL. */
-    config.render_alignment = (esp_display_present_render_alignment_t) {
-        .x_pixels = 4,
-        .width_pixels = 4,
-    };
-    ESP_RETURN_ON_ERROR(board_display_init(&config.display), TAG, "display initialization");
-    ESP_RETURN_ON_ERROR(board_touch_init(&config.touch), TAG, "touch initialization");
-    *out_config = config;
     return ESP_OK;
 }

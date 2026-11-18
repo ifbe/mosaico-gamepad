@@ -9,7 +9,7 @@
 
 | 组件 | 职责 |
 | --- | --- |
-| `app_cfg` | NVS 配置（USB/BT 各功能位、VID/PID、布局）、RPC 0x4700 |
+| `app_cfg` | NVS 配置（USB/BT/BLE 各功能位、VID/PID、音频）、RPC 0x4700；页面切换通过 UI 注册的回调转发。BT/BLE 掩码允许 sensor 位（`APP_CLASS_BT_ALL`），只有 USB 掩码含 Sony/Xbox 身份 |
 | `app_usb_core` | USB 端点分配（配合 Iris 的 console CDC） |
 | `app_usb_hid` | USB HID 三接口（手柄/鼠标/键盘）+ 可选 Sony 接口；BT 共用其报告描述符 |
 | `app_usb_audio` | UAC2 播放 + 采集 |
@@ -18,12 +18,14 @@
 | `app_btclassic_hid` | BR/EDR HID（HIDP）设备 |
 | `app_btclassic_audio` | A2DP sink + HFP HF |
 | `app_audio_codec` | ES8311/I2S 播放与麦克风、音量策略（源自 `projects/audio`） |
-| `app_ui_core` | 场景/布局/芯片/终端日志渲染 + 25 fps 定时器 |
-| `app_ui_display` | 面板与触摸初始化、GSP present 配置 |
-| `app_ui_touch` | 触摸→输入映射、四角布局、BOOT 键翻页 |
+| `app_sensor` | BMI270 100 Hz（mg / 0.1 dps）+ BMM150 磁力计，供 sensor 接口与 Sony 报文 |
+| `app_ui_core` | 页面语义（翻页/鼠标/键盘/手柄/设置）、HID 上报、overlay、场景与定时器 |
+| `app_ui_display` | 只点屏并给出 presenter 硬件描述（不碰触摸、不依赖 esp-gsp） |
+| `app_ui_touch` | 只做设备：CST9220 轮询 + BOOT 键 → `app_input_event_t` 事件队列 |
 | `app_log` | 自己的日志环形缓冲（供终端页） |
 
-布局枚举：`blank / gamepad / mouse / keyboard / terminal / setting`，BOOT 键循环，四角（64×64）快捷切换。
+布局枚举：`blank / gamepad / mouse / keyboard / terminal / setting`，只靠 BOOT 键循环与 RPC 切换
+（屏幕四角切换已移除）。手柄页在摇杆两侧各有 LB/LS/SELECT/LT 与镜像的 RB/RS/START/RT，布局见 `docs/ui.md`。
 
 ---
 
@@ -54,11 +56,15 @@ S31 上「开机后再插 USB」偶发不枚举，Iris 里加了看门狗：未�
 
 ## 二、HID 报告
 
-- 手柄：report ID 1，6 字节（16 键 + 4 轴）
+- 手柄：report ID 1，8 字节（2 字节按键 + X/Y/Rx/Ry + Z(LT)/Rz(RT)）
+- 运动：report ID 4，18 字节（3×int16 加速度 / 3×int16 角速度 / 3×int16 磁力）
 - 鼠标：report ID 2，5 字节（按键 + X + Y + 滚轮 + AC Pan）
 - 键盘：report ID 3，**8 字节，布局必须是 `[修饰键][保留][6 键码]`**（键码从 index 2 开始；曾因布局错误导致完全不响应）
 
 `tud_hid_n_ready(inst)` 必须按接口实例判断；鼠标增量只有在报文被接受后才清零（否则丢帧）。
+
+`tud_hid_descriptor_report_cb()` 必须回答**每一个**已注册实例（含 sensor / Sony），否则 TinyUSB 取报表
+描述符时会从空指针拷贝 → panic，连带 UAC2 与 Iris console 一起失效（§6.8）。
 
 ### 2.1 USB 与蓝牙彻底解耦（已改）
 
@@ -83,7 +89,28 @@ S31 上「开机后再插 USB」偶发不枚举，Iris 里加了看门狗：未�
 - 保留 250 ms 的 keepalive：把两个传输的快照都置为无效，强制重发当前状态
 - 鼠标增量由触摸侧累加（`s_mouse_dx` 等），每条传输各自计算「未发送的差值」，快滑时按 127 截断，剩余量留在累加器里下次再发
 
-### 2.2 经典 HID 延迟的另一半：sniff（见 §4.2）
+### 2.2 HID usage 规范对照（2026-11-18）
+
+参考：HID Usage Tables（Generic Desktop / Button 页）、HID Sensor Usages（Sensor 页 0x20，
+[Linux `hid-sensor-ids.h`](https://github.com/torvalds/linux/blob/master/include/linux/hid-sensor-ids.h) 是最好查的编号表）、
+Apple Accessory Design Guidelines 的 6 轴 IMU 与手柄示例、Android 的 Xbox `.kl` 映射。
+
+| 项 | 我们原来的写法 | 规范/惯例 | 结论 |
+| --- | --- | --- | --- |
+| 手柄集合 | `Usage (Game Pad 0x05)` + Application | 同上 | ✅ 合规 |
+| 手柄按键 | Button 页 `Usage Min 1 / Max 16`，Logical 0..1 | 同上 | ✅ |
+| 左摇杆 | `X (0x30)` / `Y (0x31)` | X/Y = 左摇杆 | ✅ 与 Xbox/Linux/Android 一致 |
+| 右摇杆 | `Rx (0x33)` / `Ry (0x34)` | Rx/Ry = 右摇杆 | ✅ |
+| 扳机 | `Z (0x32)` / `Rz (0x35)`，0..255 绝对量 | Z/Rz = 扳机（Xbox 系） | ✅ 用法对，但**声明顺序**是 X,Y,**Rx,Ry,Z,Rz**，与常见 X,Y,Z,Rx,Ry,Rz 不同；按字段顺序解析的主机会把轴错位 |
+| 摇杆范围 | 0..255（中心 128） | Xbox 用有符号 -32768..32767（中心 0） | ⚠️ 合法但不通用，按有符号解释的主机会偏到右下 |
+| 十字键 | 4 个 Button bit | 通常用 `Hat switch (0x39)` | ⚠️ 合法，但 Apple/ADT 之类按 Hat 找方向键 |
+| 运动接口 | **vendor 页 0xFF00，usage 1**，9×int16 一包 | Sensor 页 0x20：`Accelerometer 3D 0x73` / `Gyrometer 3D 0x76` / `Compass 3D 0x83`，数据 usage 0x453-0x455 / 0x457-0x459 / 0x485-0x487 | ❌ 已改（2026-11-18），仍共用 report ID 4 保持 18 字节线格式 |
+
+**尚未做**（会改线格式，需要确认）：手柄摇杆改成有符号、usage 顺序改成 X,Y,Z,Rx,Ry,Rz、
+十字键改 Hat switch、增加 `Physical Min/Max` 与 `Unit`/`Unit Exponent` 属性；
+运动接口补 `Report Interval (0x30E)` / `Report State (0x316)` 等 Feature 属性（Windows 传感器栈需要）。
+
+### 2.3 经典 HID 延迟的另一半：sniff（见 §4.2）
 
 ---
 
@@ -176,7 +203,62 @@ sniff→active 往返约 **40–50 ms**，直接主导输入延迟，并且会�
 **踩过的弯路**：只调 `esp_bt_gap_set_qos` 无效；「每 2 秒重申 QoS」也无效——因为报文发送路径里
 的 sniff 请求触发得比重申更频繁。
 
+**2026-11-19 新证据（待验证，尚未改代码）**：实测「通话中蓝牙鼠标完全不卡，挂断后立刻又卡」。
+这和上面的根因完全吻合：
+
+- 通话期间 §4.3 的 1 秒定时器持续把 ACL 顶回 active，HID 报文和 SCO 走同一条 ACL，
+  所以 sniff 消失、鼠标顺滑
+- 挂断后定时器停止，`HD : 6` 表又开始每发一个报文就请求 sniff（延时 0），卡顿立刻回来
+
+也就是说**鼠标卡顿和通话没声音是同一个根因**，同一套项目侧改法可以处理：
+
+1. 在 `app_btclassic_hid.c` 里，经典 HID 连接后起一个 1 秒周期 `esp_timer`，回调同样调用
+   `bta_dm_pm_active()`（复用 `app_btclassic_audio.c` 里的 `force_link_active()` 思路），
+   断开时停表
+2. 验证口径：先记录基线（`hci cmd send: sniff` 每分钟条数 + 鼠标手感），改后同样记录；
+   sniff 归零且手感跟通话中一致才算成立
+3. 注意不要在通话期间重复叠加两套定时器——可以根据 HFP 是否已连接决定由哪边负责顶 active
+
 ---
+
+
+### 4.3 通话没声音：sniff 把 eSCO 挤掉（2026-11-18，已修）
+
+现象：手机已连上、`call=1`、`sco_try=1`、`sco_ok=1`，但 `sco=0`、`rx=0 tx=0`，通话双方都没声音。
+
+日志顺序：
+
+```
+W BT_HCI: hci cmd send: sniff: hdl 0x801, intv(10 18)
+W BT_HCI: hcif mode change: hdl 0x801, mode 2, intv 18
+I bt_classic: link mode 2
+E OLM_CONN: pend list full on link:0, refuse proc_type:0x800d     ← eSCO 建立被控制器拒绝
+```
+
+原因：Bluedroid 的电源管理表给 HFP（`bta_dm_cfg.c` 里 `/* HS : 4 */`）允许 sniff，而且
+`sco open, active` 这一项本身就配成 `BTA_DM_PM_SNIFF3` —— 通话中都会请求 sniff。ACL 进 sniff 后，
+控制器的挂起链表被占满，随后的 eSCO setup 直接被拒，通话要等下一次重试才有声音（“打了一会儿对方才听见”）。
+
+**修法（2026-11-19，项目侧，不改 IDF）**：表是 `const`（放 flash）、没有 Kconfig、也没有公开 API
+能关掉 host 主动发的 `HCI_Sniff_Mode`，但 BTA 电源管理器**导出**了：
+
+```c
+void bta_dm_pm_active(uint8_t peer_addr[6]);   /* bta_dm_pm.c，内部符号，无公开头文件 */
+```
+
+它内部就是 `BTM_SetPowerMode(..., BTM_PM_MD_ACTIVE)`，会把链路从 sniff 拉回 active。
+`app_btclassic_audio.c` 里这样用：
+
+- `force_link_active()`：遍历已配对设备（一般只有一个），逐个 `bta_dm_pm_active()`
+- **收到 RING / CIND call 事件时先 `force_link_active()`，再 `esp_hf_client_connect_audio()`**
+  —— 顺序很关键，晚于发起请求就没用了
+- HFP 进入 `SLC_CONNECTED` 后起 **1 秒周期 `esp_timer`**，通话期间持续顶回 active
+  （表格会在 SCO open 后 7 秒再次请求 sniff）；断链时停表
+
+实测：改前“通话要等一会才出声”，改后 `sco_try=0 sco_ok=1` 一次建链、`amp≈2200`、对方立即能听到。
+
+风险：`bta_dm_pm_active` 是 IDF 内部符号（本项目锁定 IDF SHA，暂时安全）。若将来升级 IDF 后它消失，
+链接会报 undefined reference，届时再考虑回退到 `patches/` 方式（历史记录见 git log）。
 
 ## 五、音频（A2DP / HFP）
 
@@ -228,6 +310,19 @@ peak=1025                     环形缓冲长期满
 
 **若将来要彻底解决 75%**：需要让 AG 协商更大的 eSCO 包（设备侧主动权不在我们），或接受带宽做重采样适配（音调正确但频带变窄）。
 
+**2026-11-18 复测（重要修正）**：另一台手机协商出的是 **5 ms / 120 字节**（≈207 次/秒 → 要求 24.8 kB/s），
+而 CVSD 8 kHz 的 PCM 只有 16 kB/s（5 ms 只该要 80 B），所以 `pull_out/pull_req` 稳定在 **66.7%**。
+但通话**听感正常**——这个比例是「请求帧大小 × 帧率」与 8 kHz PCM 的不匹配，**不能当作音质指标**，
+真正要看的是 `mic rate ... amp=`（生产速率 + 麦克风峰值）。
+
+这一轮真正的问题出在上行生产端，两个都要满足：
+
+1. **`bt_mic` 优先级只有 3**，被 UI/render（4/6）压住 → 只跑 66 次/秒 → 少 1/3 → 对方听不清。改成 **5**。
+2. **上行环没有余量**：`peak` 一直是 160 B（刚好一个生产块），栈的 120 B 拉取经常只拿到 80 B 并立刻重试。
+   在 `hfp_sco_start()` 里预填 **20 ms 静音**（`sco_rate/50` 字节）后 `peak` 稳定 320 B，听感恢复。
+
+另外：`MIC_READ_FRAMES` 改 5 ms（`HFP_FRAMES*3/2`）会让**对方完全听不到**，必须保持 10 ms（`HFP_FRAMES*3`）。
+
 ### 5.4 麦克风消费者：直连模式没有独立游标
 
 `APP_AUDIO_MIC_FANOUT_ENABLE=0` 时，`app_audio_codec_mic_consumer_read()`：
@@ -257,6 +352,50 @@ peak=1025                     环形缓冲长期满
 
 通话时对端声音小，多数情况是**手机侧通话音量**，不是本机问题。
 
+### 5.8 通话排障顺序（照这个顺序查，别从日志里猜）
+
+**第 0 步：确认链路真的通了。** 只看 `bt_classic: status` 这一行：
+
+```
+paired=1 a2dp_link=1 hfp=3 sco=1 call=1
+```
+
+`paired=0` 说明这台设备当前**没有已配对的手机**（刷机后手机常常不会自动重连），先让手机重新配对/连接；
+`hfp=-1` 说明 HFP SLC 没建立；`call=1` 但 `sco=0` 才是 audio 链路的问题。别在没有链路的时候分析音频。
+
+**第 1 步：ACL 有没有进 sniff。** 通话/音乐期间出现这些行就是问题：
+
+```
+W BT_HCI: hci cmd send: sniff: hdl 0x801, intv(10 18)
+W BT_HCI: hcif mode change: hdl 0x801, mode 2, intv 18
+E OLM_CONN: pend list full on link:0, refuse proc_type:0x800d   ← eSCO 建立被拒
+```
+
+原因是 Bluedroid 自己的电源管理表（`bta_dm_cfg.c`）。修法见 §4.3：把 `HS : 4`（HFP）和 `HD : 6`（HID）
+的 allowed modes 改成 `BTA_DM_PM_NO_ACTION`（改在 IDF 里，重装会丢，见 §九）。
+**判据**：补丁后一次启动里 `hci cmd send: sniff` 应为 0 条。
+
+**第 2 步：上行生产端速率。** 看 5 秒一次的
+
+```
+bt_classic: mic rate: 100 iters/s, 16000 B/s, amp=2500
+```
+
+- `iters/s` 必须 ≈100（10 ms 一块）。约 66 次/秒 → 麦克风任务被抢占，检查 `bt_mic` 优先级（必须 5，不能是 3）
+- `B/s` 必须 ≈16000（8 kHz × 2 B）。偏低同上
+- `amp` 是这 5 秒的峰值：说话时应有几百~几千；**一直是 0 说明麦克风通路没声音**，与 SCO 链路无关
+- `MIC_READ_FRAMES` 必须是 `HFP_FRAMES*3`（10 ms）；改成 5 ms 会让对方完全听不到
+
+**第 3 步：上行环有没有余量。** `status` 里的 `peak`：稳定在 320 B 左右才算健康；
+一直是 160 B（刚好一个生产块）说明栈每次拿不满，需要在 `hfp_sco_start()` 预填 20 ms 静音。
+
+**第 4 步：`pull=…/…/…` 的比例不要当音质指标。** 66.7% / 75% 是**正常**的：手机按
+120 B/帧 × 帧率要 24.8 kB/s，而 CVSD 8 kHz 的 PCM 只有 16 kB/s。判据只有听感和第 2 步的 `amp`。
+
+**第 5 步：其它已知坑。**
+`invalid air mode: 255` = WBS/mSBC 协商失败（保持 CVSD）；`SCO xmit Q overflow` = 同步 TX 缓冲不足
+（`STATIC_SYNC_TX_BUF_NB=4`）；`rx/tx` 恒为 0 是正常的——语音走的是 legacy pull 路径，看 `lx/lt/pull`。
+
 ---
 
 ## 六、显示（GSP / CO5300）
@@ -279,7 +418,64 @@ BSP 原本 `io_config.flags.psram_dma_direct = false`，颜色数据在 PSRAM �
 
 `esp_display_present` 的 `drawbuf.in_psram = true`（`app_ui_display.c`），否则内部 DMA 会被绘制缓冲占满。
 
-### 6.5 终端字符网格
+### 6.5 overlay 必须注册在首帧之前
+
+`esp_gsp_set_overlay_contributor()` 是「投递到渲染任务队列」的调用。在 `app_main` 里、
+首帧合成（181 个对象）还没结束时注册，队列一直排不进去，会**稳定**返回
+`ESP_ERR_TIMEOUT`（试过 40×50 ms 重试，全部失败），表现为「触摸起不来」。
+
+正解：用 `esp_gsp_esp_lcd_start_prepared()`，在渲染任务的首帧回调里注册 overlay
+contributor、创建定时器、推初始芯片状态。日志应出现 `overlay attached`。
+
+### 6.6 改 label 文字颜色必须先在场景里声明 color 绑定
+
+`esp_gsp_component_set_color_rgb888()` 需要组件有「canonical color 属性」。label 的 `fg_color` 是**静态**字段，
+默认不生成任何运行时属性，调用会返回错误而画面不变（这就是早期「置灰/选中变色」看着没生效的原因）。
+
+做法：给 label 加
+
+```json
+"bind": "chip_text_bt_1_color",
+"bind_target": "color",
+```
+
+编译后 `scene0/gamepad_objects.h` 会生成 `gsp_..._set_color_rgb888()`，通用的
+`esp_gsp_component_set_color_rgb888(gsp, key, rgb)` 也会开始生效。
+
+### 6.7 命中框必须和场景坐标逐像素对齐
+
+设置页芯片是 `x = 12 + 92*i`、`86×38`。代码里曾写成 `12 + 78*i`、`72` 宽，导致第 4、5 个芯片点不到、
+点「sensor」实际触发「audio/ds4」。改场景坐标时必须同步 `app_ui_input.c` 的常量。
+
+### 6.8 `tud_hid_descriptor_report_cb` 必须回答每个 HID 实例（已修，教训重要）
+
+现象：`usb_hid` 掩码包含 `APP_CLASS_SENSOR`（或 Sony 模式）并重启后，
+主机侧 **UAC2 音频设备消失**、**ESP-Iris 不应答 HELLO**，但键盘/鼠标仍勉强可用、屏幕正常。
+
+根因：`tud_hid_descriptor_report_cb()` 只遍历了 3 个通用接口的实例表：
+
+```c
+for (size_t i = 0; i < INTERFACE_COUNT; ++i)
+    if (s_usb.instance[i] == instance) return s_interfaces[i].desc;
+return NULL;   /* ← sensor / sony 的实例走到这里 */
+```
+
+而 TinyUSB 在 `GET_DESCRIPTOR(HID REPORT)` 时**不判空**：
+
+```c
+uint8_t const *desc_report = tud_hid_descriptor_report_cb(hid_itf);
+tud_control_xfer(rhport, request, (void *)(uintptr_t)desc_report, p_hid->report_desc_len);
+```
+
+于是主机枚举到第 4 个 HID 接口（sensor）时，从空指针拷贝 → panic → 重启，
+整个 USB 复合设备（连同 UAC2 和 Iris console）一起完蛋。Sony 模式当年“Iris 摸不到”
+大概率也是这个原因，而不是 VID/PID 过滤。
+
+修法：为非通用实例补上描述符（`s_desc_sensor` / `s_sony_desc`）。顺带把 sensor 的
+`ep_size` 改成 `SENSOR_REPORT_LEN + 1`：报表含 report ID 共 19 字节
+（通用接口的 9 字节打 8 字节端点一直能跑，但严格来说也该 +1）。
+
+### 6.9 终端字符网格
 
 30 行 × 60 列：字体 `fonts/Mono.ttf`（macOS 的 Andale Mono，等宽 0.6 em），字号 13，行高 16 px，y=0..464。**注意 Andale Mono 是 Apple 系统字体，不可再分发**，发布固件前需换成 DejaVu Sans Mono / Noto Sans Mono。
 
@@ -304,6 +500,7 @@ BSP 原本 `io_config.flags.psram_dma_direct = false`，颜色数据在 PSRAM �
 - `CONFIG_ESP_WIFI_ENABLED` 是**隐藏符号**（`default y if SOC_WIFI_SUPPORTED`），无法通过 sdkconfig 关闭；日志里的 `factory_network/wifi` 行来自 Vibe Mode 固件的残留日志
 - 日志环很小，`SCO xmit Q overflow`、`TE ticket` 这类逐包/逐帧告警会在几十秒内把其它日志全部挤掉。排查时用 `esp_log_level_set("BT_BTM", ESP_LOG_ERROR)` 之类临时压掉，或把它们加到 `app_log` 的过滤表里
 - `heap_caps_register_failed_alloc_callback()` 能打印失败的分配（`ALLOC FAIL <size> caps=<caps> from <func>`），排查 NO_MEM 很有用
+- 本芯片是 FreeRTOS **SMP** 移植：`taskENTER_CRITICAL()` 必须带 `portMUX_TYPE`，否则编译报 `too few arguments to function 'vPortEnterCriticalMultiCore'`
 
 ---
 
@@ -320,26 +517,37 @@ python3 mosaico.py iris test enter-recovery $P     # 先进入 Vibe Mode（conso
 python3 mosaico.py iris system-update $P           # 走 recovery 写入
 python3 mosaico.py iris logs --snapshot $P         # 拉日志
 python3 mosaico.py iris screenshot out.png $P      # 截图（不含 overlay/黑线类面板问题）
+python3 mosaico.py iris rpc 0x4700 4 --payload '{"layout":"setting"}' $P  # 远程切页
+python3 mosaico.py iris memory $P                  # 本机型返回 not_supported
 ```
 
 - 改 `sdkconfig*.defaults` 后必须 `rm -f build/sdkconfig` 再构建，否则不生效
 - 每次刷机都会重启设备、断开蓝牙；测通话前必须让手机重连（否则走手机本机音频，日志表现为 `paired=0 hfp=-1`）
-- RPC 服务 `0x4700`：1 list / 2 enable / 3 disable / 4 layout / 5 reboot / 6 set / 7 clear_bonds / 8 restart BLE adv
+- RPC 服务 `0x4700`：1 list / 2 enable / 3 disable / 4 layout / 5 reboot / 6 set / 7 clear_bonds / 8 restart BLE adv / 9 reset
 
 ---
 
 ## 九、本地修改（不在本仓库 git 内，重装依赖会丢）
 
+**ESP-IDF 现在零改动**（`git -C $IDF_PATH status` 应为空）。曾经改过、现在都已移出 IDF：
+
+| 曾经的 IDF 改动 | 现在怎么做 |
+| --- | --- |
+| `bt/host/bluedroid/bta/dm/bta_dm_cfg.c`：HS/HD 电源表禁用 sniff | 项目侧调 IDF **导出的内部符号** `bta_dm_pm_active()`，见 §4.3（`app_btclassic_audio.c`） |
+| `esp_hid/src/bt_hidd.c`：连接时 `esp_bt_gap_set_qos()` | 公开 API 挪到 `app_btclassic_hid.c`（HID 连接事件里对已配对设备设置） |
+| `esp_hid/src/ble_hidd.c`：3 条调试日志 | 删除，需要时用 `esp_log_level_set` |
+
+仍然在 IDF 之外的改动（同一台机器上的依赖，重装会丢）：
+
 | 文件 | 修改 |
 | --- | --- |
-| `esp-idf/components/esp_hid/src/bt_hidd.c` | 引入 `esp_gap_bt_api.h`；经典 HID 连接时 `esp_bt_gap_set_qos(bda, 20)` |
-| `esp-idf/components/bt/host/bluedroid/bta/dm/bta_dm_cfg.c` | HD profile 电源表 allowed modes 改为 `BTA_DM_PM_NO_ACTION`（禁用 sniff/park，修 HID 延迟） |
-| `esp-idf/components/esp_hid/src/ble_hidd.c` | 3 条 `ESP_LOGE("DBG ...")` 调试日志（creat attr tab / CONNECT / DISCONNECT）——仅诊断用 |
 | `submodule/esp-mosaico-bsp/.../onboard/display.c` | `psram_dma_direct = true` |
 | `submodule/.../ESP-Iris/.../esp_iris_transport_usb.c` | USB 热插拔看门狗 `usb_hotplug_watchdog()` |
 | `esp_hid`/`esp_lcd` 等受管组件 | 不要手改，升级会被覆盖 |
 
-`projects/gamepad/patches/` 里的 `0001/0002` 是历史补丁，当前代码已不依赖，可删除。
+注意：`bta_dm_pm_active()` 没有公开头文件，靠的是 IDF 内部符号。本项目锁定 IDF SHA，暂时安全；
+升级 IDF 后若链接报 undefined reference，就回到"改 `bta_dm_cfg.c` 电源表"的方式（git log 里有那次提交）。
+
 
 ---
 

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "app_cfg.h"
-#include "app_ui_touch.h"
 #include "app_log.h"
+#include "app_sensor.h"
 #include "app_bt_core.h"
 #include "app_btclassic_audio.h"
 #include "app_btclassic_hid.h"
-#include "app_ui_display.h"
 #include "app_features.h"
 #include "app_ui.h"
 #include "app_usb_audio.h"
@@ -14,12 +13,10 @@
 #include "esp_heap_caps.h"
 #include "esp_iris.h"
 #include "esp_iris_usb_hid.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "iris_ota_support.h"
 #include "iris_screen_mirror.h"
 #include "nvs_flash.h"
-#include "ui_bundle.h"
 
 static const char *TAG = "gamepad";
 
@@ -35,11 +32,6 @@ static void log_internal_heap(const char *stage)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
-
-/* The composition root retains owned handles, never controller internals. */
-static struct {
-    esp_gsp_handle_t ui;
-} application;
 
 void app_main(void)
 {
@@ -70,6 +62,9 @@ void app_main(void)
     unsigned hid_count = app_usb_core_hid_interface_count(app_cfg_classes());
     if (app_cfg_usb_screen_mode() != APP_USB_HID_GENERIC) {
         ++hid_count; /* the optional Sony-compatible interface takes one more */
+    }
+    if ((app_cfg_classes() & APP_CLASS_SENSOR) != 0) {
+        ++hid_count; /* the motion interface takes one more */
     }
     const uint8_t mic_ep = app_usb_core_mic_endpoint(first_ep, hid_count);
 
@@ -108,45 +103,23 @@ void app_main(void)
     }
 #endif
 
-    esp_gsp_config_t config;
-    const esp_err_t err = ui_bundle_open(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "GSP UI unavailable (0x%x); Recovery RPC remains active", err);
-        return;
-    }
-    esp_gsp_esp_lcd_config_t display;
-    const esp_err_t display_err = app_ui_display_init(&display);
-    if (display_err != ESP_OK) {
-        ESP_LOGE(TAG, "Display unavailable (0x%x); Recovery RPC remains active", display_err);
-        return;
-    }
-    /* The render task stack does not need internal RAM; PSRAM keeps the
-     * internal pool free for the Bluetooth controller. */
-    display.task_stack_psram = true;
+    /* The UI owns the panel, the scene and the input device. It is optional for
+     * diagnostics: if it fails the device must still boot so the failure can be
+     * inspected over RPC. */
     ESP_ERROR_CHECK(iris_screen_mirror_init());
-    /* GSP must not poll the controller: app_touch is the single reader. */
-    esp_lcd_touch_handle_t touch = display.touch;
-    display.touch = NULL;
-    /* The UI is optional for diagnostics: if the internal RAM is too tight the
-     * device must still boot so the failure can be inspected over RPC. */
-    const esp_err_t gsp_err = esp_gsp_esp_lcd_start(&config, &display, &application.ui);
-    if (gsp_err != ESP_OK) {
-        ESP_LOGE(TAG, "GSP start failed (0x%x); headless boot", gsp_err);
-        log_internal_heap("after gsp failure");
-        return;
-    }
-    ESP_ERROR_CHECK(iris_screen_mirror_attach(application.ui));
     ESP_LOGI(TAG, "boot: ui");
-    ESP_ERROR_CHECK(app_ui_start(application.ui));
-    app_ui_refresh_chips();
+    const esp_err_t ui_err = app_ui_start();
+    if (ui_err != ESP_OK) {
+        ESP_LOGE(TAG, "UI unavailable (0x%x); headless boot", ui_err);
+        log_internal_heap("after ui failure");
+    } else {
+        ESP_ERROR_CHECK(iris_screen_mirror_attach(app_ui_handle()));
+    }
     log_internal_heap("after ui");
     ESP_LOGI(TAG, "boot: hid");
 #if APP_FEATURE_USB_HID || APP_FEATURE_ANY_BT_HID
     ESP_ERROR_CHECK(app_usb_hid_start());
 #endif
-    if (touch != NULL) {
-        ESP_ERROR_CHECK(app_ui_touch_start(application.ui, touch));
-    }
 #if APP_FEATURE_ANY_BT
     /* Bluetooth is an optional function: a failure here must not take the
      * gamepad down. The error is logged and the rest of the app keeps running. */
@@ -169,6 +142,12 @@ void app_main(void)
     }
 #endif
     log_internal_heap("after bluetooth");
+    /* The IMU feeds the motion interface and the Sony reports; a board without
+     * one only loses those, so failure stays non-fatal. */
+    const esp_err_t sensor_err = app_sensor_start();
+    if (sensor_err != ESP_OK) {
+        ESP_LOGW(TAG, "IMU unavailable: %s", esp_err_to_name(sensor_err));
+    }
     ESP_LOGI(TAG, "boot: complete");
     /* GSP retains the callback context; the UI, HID bridge and timers live
      * until reboot. Teardown would have to quiesce GSP before closing the UI. */

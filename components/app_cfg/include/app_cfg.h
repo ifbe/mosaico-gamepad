@@ -21,7 +21,16 @@ extern "C" {
  * top of whichever generic classes are enabled. They are mutually exclusive. */
 #define APP_CLASS_DS4 (1u << 3)
 #define APP_CLASS_DS5 (1u << 4)
-#define APP_CLASS_USB_ALL (APP_CLASS_ALL | APP_CLASS_DS4 | APP_CLASS_DS5)
+/** USB-only motion interface (BMI270 accel/gyro + optional magnetometer). */
+#define APP_CLASS_SENSOR (1u << 5)
+/** Reserved: Xbox emulation placeholder, not implemented yet. */
+#define APP_CLASS_XBOX (1u << 6)
+#define APP_CLASS_USB_ALL (APP_CLASS_ALL | APP_CLASS_DS4 | APP_CLASS_DS5 | APP_CLASS_SENSOR | APP_CLASS_XBOX)
+/** Bluetooth and BLE transports may also carry the motion report. */
+#define APP_CLASS_BT_ALL (APP_CLASS_ALL | APP_CLASS_SENSOR)
+/** Factory default for the USB mask: the generic classes plus the motion
+ * interface. Bluetooth and BLE default to the generic classes only. */
+#define APP_CLASS_USB_DEFAULT (APP_CLASS_ALL | APP_CLASS_SENSOR)
 
 /** Bluetooth transports; persisted and applied when the controller starts. */
 typedef enum {
@@ -89,6 +98,13 @@ esp_err_t app_cfg_set_usb_hid(uint32_t mask);
 /** Persist the Bluetooth HID mask. */
 esp_err_t app_cfg_set_bt_hid(uint32_t mask);
 
+/** BLE HID class mask, independent from the classic link. */
+uint32_t app_cfg_ble_hid(void);
+esp_err_t app_cfg_set_ble_hid(uint32_t mask);
+
+/** Restore every setting to its compiled default (USB, BT, BLE, layout). */
+esp_err_t app_cfg_reset_all(void);
+
 /** Persist the USB audio switch. */
 esp_err_t app_cfg_set_usb_audio(bool enabled);
 
@@ -97,6 +113,20 @@ esp_err_t app_cfg_set_bt_audio(uint32_t mask);
 
 /** RPC service id used for the configuration commands. */
 #define APP_CFG_RPC_SERVICE 0x4700
+
+/** Screen-layout access for the "layout" RPC method (id 4).
+ *
+ * The UI owns the pages; app_cfg only knows how to reach them, so the UI
+ * registers these two callbacks at startup and this component stays free of
+ * any UI dependency. Both run in the RPC caller's task context.
+ * @c apply returns the name it switched to, or NULL for an unknown name. */
+typedef struct {
+    const char *(*name)(void);
+    const char *(*apply)(const char *name);
+} app_cfg_layout_rpc_t;
+
+/** Register (or clear with NULL) the layout hooks. Call once at UI startup. */
+void app_cfg_set_layout_rpc(const app_cfg_layout_rpc_t *rpc);
 
 #ifdef __cplusplus
 }

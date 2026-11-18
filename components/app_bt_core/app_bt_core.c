@@ -122,16 +122,18 @@ const char *app_bt_core_classic_name(void)
 
 /* The report descriptors live in app_usb_core; the Bluetooth map is assembled
  * here from the subset selected by the persisted bt_hid mask. */
-static uint8_t s_report_map[192];
-static size_t s_report_map_len;
+/* The two transports have independent class masks, so each gets its own map. */
+static uint8_t s_report_map_ble[192];
+static size_t s_report_map_ble_len;
+static uint8_t s_report_map_bt[192];
+static size_t s_report_map_bt_len;
 
-static size_t build_report_map(void)
+static size_t build_report_map(uint32_t mask, uint8_t *out, size_t cap)
 {
-    const uint32_t mask = app_cfg_bt_hid();
     static const uint32_t class_bit[3] = {
         APP_CLASS_GAMEPAD, APP_CLASS_MOUSE, APP_CLASS_KEYBOARD,
     };
-    s_report_map_len = 0;
+    size_t used = 0;
     const size_t classes = app_usb_hid_class_count();
     for (size_t i = 0; i < classes && i < 3; ++i) {
         if ((mask & class_bit[i]) == 0) {
@@ -139,13 +141,21 @@ static size_t build_report_map(void)
         }
         size_t len = 0;
         const uint8_t *desc = app_usb_hid_class_desc(i, &len);
-        if (desc == NULL || s_report_map_len + len > sizeof(s_report_map)) {
+        if (desc == NULL || used + len > cap) {
             continue;
         }
-        memcpy(&s_report_map[s_report_map_len], desc, len);
-        s_report_map_len += len;
+        memcpy(&out[used], desc, len);
+        used += len;
     }
-    return s_report_map_len;
+    if ((mask & APP_CLASS_SENSOR) != 0) {
+        size_t len = 0;
+        const uint8_t *desc = app_usb_hid_sensor_desc(&len);
+        if (desc != NULL && used + len <= cap) {
+            memcpy(&out[used], desc, len);
+            used += len;
+        }
+    }
+    return used;
 }
 
 esp_err_t app_bt_core_hid_start(void)
@@ -153,7 +163,11 @@ esp_err_t app_bt_core_hid_start(void)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (build_report_map() == 0) {
+    s_report_map_ble_len = build_report_map(app_cfg_ble_hid(), s_report_map_ble,
+                                            sizeof(s_report_map_ble));
+    s_report_map_bt_len = build_report_map(app_cfg_bt_hid(), s_report_map_bt,
+                                           sizeof(s_report_map_bt));
+    if (s_report_map_ble_len == 0 && s_report_map_bt_len == 0) {
         ESP_LOGI(TAG, "no Bluetooth HID class enabled");
         return ESP_OK;
     }
@@ -163,25 +177,34 @@ esp_err_t app_bt_core_hid_start(void)
     esp_err_t worst = ESP_OK;
     if (s_mode == APP_BT_BLE || s_mode == APP_BT_BOTH) {
 #if APP_FEATURE_BLE_HID
-        const esp_err_t err = app_ble_hid_start(s_report_map, s_report_map_len);
+        if (s_report_map_ble_len == 0) {
+            ESP_LOGW(TAG, "BLE HID has no enabled classes");
+        } else {
+        const esp_err_t err = app_ble_hid_start(s_report_map_ble, s_report_map_ble_len);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "BLE HID unavailable: %s", esp_err_to_name(err));
             worst = err;
+        }
         }
 #endif
     }
     if (s_mode == APP_BT_CLASSIC || s_mode == APP_BT_BOTH) {
 #if APP_FEATURE_BT_CLASSIC_HID
-        const esp_err_t err = app_btclassic_hid_start(s_report_map, s_report_map_len);
+        if (s_report_map_bt_len == 0) {
+            ESP_LOGW(TAG, "classic HID has no enabled classes");
+        } else {
+        const esp_err_t err = app_btclassic_hid_start(s_report_map_bt, s_report_map_bt_len);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Classic HID unavailable: %s", esp_err_to_name(err));
             worst = err;
+        }
         }
 #endif
     }
     /* Reports are routed whenever at least one transport came up. */
     app_usb_hid_attach_bt(app_bt_core_hid_connected, app_bt_core_hid_send);
-    ESP_LOGI(TAG, "HID ready (%u-byte report map)%s", (unsigned)s_report_map_len,
+    ESP_LOGI(TAG, "HID ready (ble %u B, classic %u B)%s",
+             (unsigned)s_report_map_ble_len, (unsigned)s_report_map_bt_len,
              worst == ESP_OK ? "" : " (one transport failed)");
     return worst;
 }
@@ -198,12 +221,30 @@ bool app_bt_core_hid_connected(void)
     return connected;
 }
 
+/* Report id -> the class bit that owns it. A transport that did not enable the
+ * class has no such report in its map, so sending would only log failures. */
+static uint32_t class_for_report(uint8_t report_id)
+{
+    switch (report_id) {
+    case 1: return APP_CLASS_GAMEPAD;
+    case 2: return APP_CLASS_MOUSE;
+    case 3: return APP_CLASS_KEYBOARD;
+    case 4: return APP_CLASS_SENSOR;
+    default: return 0;
+    }
+}
+
 void app_bt_core_hid_send(uint8_t report_id, const uint8_t *data, size_t len)
 {
+    const uint32_t cls = class_for_report(report_id);
 #if APP_FEATURE_BLE_HID
-    app_ble_hid_send(report_id, data, len);
+    if (cls == 0 || (app_cfg_ble_hid() & cls) != 0) {
+        app_ble_hid_send(report_id, data, len);
+    }
 #endif
 #if APP_FEATURE_BT_CLASSIC_HID
-    app_btclassic_hid_send(report_id, data, len);
+    if (cls == 0 || (app_cfg_bt_hid() & cls) != 0) {
+        app_btclassic_hid_send(report_id, data, len);
+    }
 #endif
 }
