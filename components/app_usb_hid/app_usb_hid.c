@@ -45,34 +45,43 @@ static const uint8_t s_desc_mouse[] = {
 };
 
 
-/* Motion interface, HID Sensors page (0x20) as defined by "HID Sensor Usages":
- * Accelerometer 3D (0x73) / Gyrometer 3D (0x76) / Compass 3D (0x83), each in its
- * own physical collection with the X/Y/Z data usages (0x453..0x455,
- * 0x457..0x459, 0x485..0x487). The three sensors share report ID 4 so the
- * 18-byte wire format is unchanged; values keep the device scaling (mg,
- * 0.1 dps, 0.1 uT) because no Unit/Unit Exponent properties are exported. */
+/* Motion interface, HID Sensors page (0x20).
+ *
+ * Everything lives inside one top-level Application collection ("Motion"),
+ * because Windows' HID parser rejects a Report ID (or any main item) that sits
+ * outside a top-level collection - it reports the interface as an invalid HID
+ * descriptor and the whole interface disappears from HIDClass, which is why
+ * hidapi could not enumerate it. Inside, the three standard sensor collections
+ * share report ID 4 so the 18-byte wire format is unchanged: accelerometer,
+ * gyrometer and compass, 3 x int16 each. Values keep the device scaling (mg,
+ * 0.1 dps, 0.1 uT); no Unit/Unit Exponent or property Feature reports are
+ * exported, so Windows' sensor class driver may still decline to bind. */
 static const uint8_t s_desc_sensor[] = {
     0x05, 0x20,                   /* Usage Page (Sensors) */
-    0x85, 0x04,                   /* Report ID (4) */
-    0x16, 0x00, 0x80,             /* Logical Minimum (-32768) */
-    0x26, 0xFF, 0x7F,             /* Logical Maximum (32767) */
-    0x75, 0x10,                   /* Report Size (16) */
-    0x95, 0x03,                   /* Report Count (3) */
+    0x09, 0x70,                   /* Usage (Motion) */
+    0xA1, 0x01,                   /* Collection (Application) */
+    0x85, 0x04,                   /*   Report ID (4) */
+    0x16, 0x00, 0x80,             /*   Logical Minimum (-32768) */
+    0x26, 0xFF, 0x7F,             /*   Logical Maximum (32767) */
+    0x75, 0x10,                   /*   Report Size (16) */
+    0x95, 0x03,                   /*   Report Count (3) */
 
-    0x09, 0x73, 0xA1, 0x00,       /* Usage (Accelerometer 3D), Collection (Physical) */
+    0x09, 0x73, 0xA1, 0x00,       /*   Usage (Accelerometer 3D), Collection (Physical) */
     0x09, 0x53, 0x09, 0x54, 0x09, 0x55, /* Acceleration X/Y/Z Axis */
-    0x81, 0x02,                   /* Input (Data,Var,Abs) */
-    0xC0,                         /* End Collection */
+    0x81, 0x02,                   /*     Input (Data,Var,Abs) */
+    0xC0,                         /*   End Collection */
 
-    0x09, 0x76, 0xA1, 0x00,       /* Usage (Gyrometer 3D), Collection (Physical) */
+    0x09, 0x76, 0xA1, 0x00,       /*   Usage (Gyrometer 3D), Collection (Physical) */
     0x09, 0x57, 0x09, 0x58, 0x09, 0x59, /* Angular Velocity X/Y/Z Axis */
     0x81, 0x02,
     0xC0,
 
-    0x09, 0x83, 0xA1, 0x00,       /* Usage (Compass 3D), Collection (Physical) */
+    0x09, 0x83, 0xA1, 0x00,       /*   Usage (Compass 3D), Collection (Physical) */
     0x09, 0x85, 0x09, 0x86, 0x09, 0x87, /* Magnetic Flux X/Y/Z Axis */
     0x81, 0x02,
     0xC0,
+
+    0xC0,                         /* End Collection (Application) */
 };
 
 static const uint8_t s_desc_kbd[] = {

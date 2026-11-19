@@ -1,53 +1,48 @@
 # ESP-Mosaico gamepad
 
-Created with `python mosaico.py project init my_app`.
-The same GSP 1.5.1 scene and portable C UI run on PC and ESP-Mosaico.
+ESP32-S31 handheld controller: a 480x480 touch surface that presents itself to a
+host as HID over USB, Bluetooth Classic and BLE, with audio and hands-free calls.
 
-From the workspace root:
+## What each link provides
+
+| Link | Host sees |
+| --- | --- |
+| USB (composite with ESP-Iris) | HID gamepad, mouse and keyboard, plus an optional motion interface; optional DualShock 4 / DualSense emulation; UAC2 speaker + microphone at 48 kHz |
+| Bluetooth Classic | HID device (gamepad / mouse / keyboard, motion optional), A2DP sink, HFP hands-free for calls |
+| BLE | HID over GATT (HOGP) with its own class mask; advertising while idle |
+
+Every transport keeps its own class mask in NVS. The on-screen settings page and
+the RPC service `0x4700` change them; a reboot applies the change.
+
+## Screen
+
+Six pages: idle, mouse, keyboard, gamepad, terminal, settings. The BOOT key or
+the layout RPC switches pages. Touch drives pointer, keyboard and gamepad input;
+the gamepad page adds LB/RB, LS/RS, SELECT/START and analog LT/RT sliders around
+the two sticks. The settings page toggles the class masks for USB, Classic
+Bluetooth and BLE.
+
+## Build and install
 
 ```sh
-python mosaico.py project sim --project projects/gamepad --interactive
-python mosaico.py recover
-python mosaico.py iris system-update --project projects/gamepad
+. ../env.sh
+python3 submodule/esp-mosaico-utils/mosaico-tools/skills/idf-low-noise-build/scripts/idf_low_noise_build.py \
+        --project projects/gamepad build
+python3 mosaico.py iris test enter-recovery --project projects/gamepad
+python3 mosaico.py iris system-update --project projects/gamepad
+python3 mosaico.py iris logs --snapshot --project projects/gamepad
 ```
 
-Run `recover` before the first install on a blank or unverified device.
-Use `system-update` for new apps or changed resources/layouts. Use `app-update`
-only for code changes with an identical full partition table and resources.
+The ESP-IDF checkout must stay unmodified (`git -C "$IDF_PATH" status` empty).
 
-Application components:
+## Documentation
 
-- `components/app_hello`: portable UI behavior and private controller state.
-- `components/app_display`: BSP-to-GSP display and optional touch policy.
-- `main`: device startup and dependency composition only.
-- `components/app_hello/host`: desktop adapter and its separate CMake build,
-  reusing the same controller and public header; excluded from the ESP32 build.
-- `components/app_hello/ui/main.json`: authored scene; generated bindings and bundles stay in the build.
-
-`project sim` discovers a unique scene under `components/*/ui/main.json` (or the
-older root `ui/main.json`). With multiple scenes, select one using `--scene PATH`,
-relative to the project. This previews only that scene; omit `--scene` to run the
-PC backend and its compiled application behavior.
-
-Dependency direction is `main -> app_hello -> ESP-GSP` and
-`main -> app_display -> BSP/ESP-GSP`. Neither application component depends on
-`main` or on its sibling. Public headers live in `include/`; private state stays
-in implementation files. Each component README includes its contract and usage.
-
-When adding behavior, keep `main` as a composition root. Add cohesive `app_*`
-components only for independent responsibilities, declare public/private CMake
-dependencies explicitly, and keep the graph acyclic. Avoid cross-module globals;
-pass handles, context and value snapshots. Keep each public API comment within
-three lines, describing its purpose and key preconditions/results. Put detailed
-ownership, lifecycle, threading and timeout contracts in the component README;
-document units and ranges beside fields.
-Third-party dependencies retain upstream names. Pins and workspace overrides live
-in `main/idf_component.yml` and the root CMake configuration. Apply local patches
-in a dedicated dependency checkout and select it with `override_path`; never edit
-`managed_components/` in place.
-
-Git, editor and hook entry files stay at the root; format rules, project policy
-and setup instructions live in `tools/quality/`. See its README to enable hooks.
-The `tools/quality/policy.json` prefix rule checks local application component names.
-Architecture and API semantics also require code review; formatter/static-analysis
-success alone does not establish those contracts.
+| Document | Contents |
+| --- | --- |
+| [docs/app_ui.md](docs/app_ui.md) | The whole UI: `app_ui_display` / `app_ui_touch` / `app_ui_core` contracts, input event model, startup order, page and settings semantics, gamepad layout, acceptance list |
+| [docs/gotcha.md](docs/gotcha.md) | Subsystem notes and triage: USB endpoints, HID descriptors, Classic/BLE HID, call audio, display, memory |
+| [docs/app_cfg.md](docs/app_cfg.md) | Class masks, NVS persistence, configuration RPC |
+| [docs/app_usb.md](docs/app_usb.md) | USB interfaces: gamepad, mouse, keyboard, Sony and motion reports, UAC2 audio |
+| [docs/app_btclassic.md](docs/app_btclassic.md) | Classic Bluetooth interfaces: HID device, A2DP sink, HFP hands-free |
+| [docs/app_ble.md](docs/app_ble.md) | BLE interface: HID over GATT (HOGP) reports and connection behaviour |
+| [docs/app_sensor.md](docs/app_sensor.md) | BMI270 / BMM150 motion source |

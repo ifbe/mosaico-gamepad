@@ -39,6 +39,25 @@ bool app_bt_core_hid_connected(void);
 /** Forward one input report to every connected Bluetooth transport. */
 void app_bt_core_hid_send(uint8_t report_id, const uint8_t *data, size_t len);
 
+/** Take the Classic ACL link out of sniff mode.
+ *
+ * Anyone may call this at any time; calls are coalesced to one every
+ * APP_BT_KICK_MIN_INTERVAL_US so several 100 Hz callers cannot flood the
+ * controller. Returns true when this call actually kicked the link (false when
+ * throttled, when Classic is disabled, or when no peer is known). Task context
+ * only. */
+bool app_bt_core_kick_acl_sniff(void);
+
+/** Remember the peer of the Classic link so kicks do not have to enumerate the
+ * bond database. Call it from the profile that learns the address. */
+void app_bt_core_note_classic_peer(const uint8_t bda[6]);
+
+/** Copy the cached Classic peer. False when no profile has reported one yet. */
+bool app_bt_core_classic_peer(uint8_t out[6]);
+
+/** Kick counters since boot, for the status line. Any pointer may be NULL. */
+void app_bt_core_kick_stats(unsigned *kicks, unsigned *throttled, unsigned *age_ms);
+
 /** LE advertising name (also the classic device name's counterpart). */
 const char *app_bt_core_le_name(void);
 

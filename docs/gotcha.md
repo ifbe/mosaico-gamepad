@@ -11,7 +11,7 @@
 | --- | --- |
 | `app_cfg` | NVS 配置（USB/BT/BLE 各功能位、VID/PID、音频）、RPC 0x4700；页面切换通过 UI 注册的回调转发。BT/BLE 掩码允许 sensor 位（`APP_CLASS_BT_ALL`），只有 USB 掩码含 Sony/Xbox 身份 |
 | `app_usb_core` | USB 端点分配（配合 Iris 的 console CDC） |
-| `app_usb_hid` | USB HID 三接口（手柄/鼠标/键盘）+ 可选 Sony 接口；BT 共用其报告描述符 |
+| `app_usb_hid` | USB HID 每个类一个接口（手柄/鼠标/键盘）+ 可选 Sony 或运动接口；BT 共用其报告描述符 |
 | `app_usb_audio` | UAC2 播放 + 采集 |
 | `app_bt_core` | 控制器/Bluedroid 启动、双身份（BLE + Classic）、报告路由 |
 | `app_ble_hid` | BLE HOGP 设备 |
@@ -25,7 +25,7 @@
 | `app_log` | 自己的日志环形缓冲（供终端页） |
 
 布局枚举：`blank / gamepad / mouse / keyboard / terminal / setting`，只靠 BOOT 键循环与 RPC 切换
-（屏幕四角切换已移除）。手柄页在摇杆两侧各有 LB/LS/SELECT/LT 与镜像的 RB/RS/START/RT，布局见 `docs/ui.md`。
+（屏幕四角切换已移除）。手柄页在摇杆两侧各有 LB/LS/SELECT/LT 与镜像的 RB/RS/START/RT，布局见 `docs/app_ui.md`。
 
 ---
 
@@ -172,7 +172,8 @@ Bluedroid 连接时停止广播；`ESP_HIDD_DISCONNECT_EVENT` 不一定派发到
 
 **现象**：`BT_SDP: the free pad for SDP record ... is full` → `BT_HIDD: HID_DevAddRecord: failed to complete SDP record` → `Setting hid parameters failed (1), now deint!`，经典 HID 完全不可用。
 
-**原因**：HID 的 SDP 记录要内嵌整个 report descriptor（162 字节），默认 `CONFIG_BT_SDP_PAD_LEN=300` 不够。
+**原因**：HID 的 SDP 记录要内嵌整个 report map（现在 166 字节起、启用运动接口时 224 字节），
+默认 `CONFIG_BT_SDP_PAD_LEN=300` 不够。
 
 **修复**：`CONFIG_BT_SDP_ATTR_LEN=1024`、`CONFIG_BT_SDP_PAD_LEN=1024`。成功标志：`BT_HIDD: Setting hid parameters success!`。
 
@@ -210,14 +211,20 @@ sniff→active 往返约 **40–50 ms**，直接主导输入延迟，并且会�
   所以 sniff 消失、鼠标顺滑
 - 挂断后定时器停止，`HD : 6` 表又开始每发一个报文就请求 sniff（延时 0），卡顿立刻回来
 
-也就是说**鼠标卡顿和通话没声音是同一个根因**，同一套项目侧改法可以处理：
+也就是说**鼠标卡顿和通话没声音是同一个根因**。修法已经收敛到一个公共入口（`app_bt_core`）：
 
-1. 在 `app_btclassic_hid.c` 里，经典 HID 连接后起一个 1 秒周期 `esp_timer`，回调同样调用
-   `bta_dm_pm_active()`（复用 `app_btclassic_audio.c` 里的 `force_link_active()` 思路），
-   断开时停表
-2. 验证口径：先记录基线（`hci cmd send: sniff` 每分钟条数 + 鼠标手感），改后同样记录；
-   sniff 归零且手感跟通话中一致才算成立
-3. 注意不要在通话期间重复叠加两套定时器——可以根据 HFP 是否已连接决定由哪边负责顶 active
+| 接口 | 语义 |
+| --- | --- |
+| `app_bt_core_kick_acl_sniff()` | 立刻把当前经典 ACL 踢出 sniff；**谁都可以随时调**，1 秒窗口内的重复调用直接丢弃（`APP_BT_KICK_MIN_INTERVAL_US`），返回本次是否真的踢了 |
+| `app_bt_core_note_classic_peer(bda)` | 缓存对端地址，踢的时候不用遍历配对列表（HFP SLC 事件会带 remote_bda；经典 HID 连接事件不带） |
+| `app_bt_core_kick_stats(kicks, throttled, age_ms)` | 计数器，进 `bt_classic: status` 的 `kick=<执行>/<节流>/<age ms>` |
+| `app_bt_core` 里的 1 秒定时器 | 持续踢。**启动条件当前是桩**：只要 Classic 启用就开着；将来收窄为「经典已连接 且（HID 某个类启用/已连接 或 通话真正建立）」 |
+
+调用点：经典 HID 连接、HFP SLC 建立、RING/CIND/audio-state 各事件，以及上面的周期定时器。
+节流判断与时间戳写入在同一个 `portMUX` 临界区里完成，避免两个任务同时通过检查。
+
+内部仍然调 `bta_dm_pm_active()`（IDF 导出、无公开头文件的符号）。
+验证口径：`kick=` 计数在增长、`hci cmd send: sniff` 每分钟 0 条、鼠标手感与通话中一致。
 
 ---
 
@@ -240,7 +247,8 @@ E OLM_CONN: pend list full on link:0, refuse proc_type:0x800d     ← eSCO 建�
 控制器的挂起链表被占满，随后的 eSCO setup 直接被拒，通话要等下一次重试才有声音（“打了一会儿对方才听见”）。
 
 **修法（2026-11-19，项目侧，不改 IDF）**：表是 `const`（放 flash）、没有 Kconfig、也没有公开 API
-能关掉 host 主动发的 `HCI_Sniff_Mode`，但 BTA 电源管理器**导出**了：
+能关掉 host 主动发的 `HCI_Sniff_Mode`，但 BTA 电源管理器**导出**了（调用封装见 §4.2 的
+`app_bt_core_kick_acl_sniff()`）：
 
 ```c
 void bta_dm_pm_active(uint8_t peer_addr[6]);   /* bta_dm_pm.c，内部符号，无公开头文件 */
@@ -553,9 +561,16 @@ python3 mosaico.py iris memory $P                  # 本机型返回 not_support
 
 ## 十、已知未解决问题
 
-1. **SCO 上行带宽只有 75%**：eSCO 每次 120 字节 / 10 ms，需 8 kHz 却只有 6.1 kHz → 对端听到音调偏低
-2. **`SCO xmit Q overflow`**：通话中控制器同步 TX 队列持续溢出（改前 120 秒 720 次），部分丢包
-3. **麦克风双消费者**：USB 采集与 SCO 在直连模式下抢同一 I2S 流（当前 USB 未开，未暴露）
-4. **BLE 事件不派发**：`ESP_HIDD_*` 事件有时收不到，只能用轮询 `esp_hidd_dev_connected()` 兜底
-5. **显示长跑**：TE 合成路径在长时间运行后仍可能 `NO_MEM`（已用 `psram_dma_direct` 大幅缓解，未根除）
-6. ~~经典 HID 延迟~~：已定位为 Bluedroid 主动请求 sniff（§4.2），已通过 `bta_dm_cfg.c` 关闭；待实机验证
+1. **经典 HID（蓝牙鼠标）卡顿**：根因同 §4.2，已改成公共踢点 + `app_bt_core` 的 1 秒定时器。
+   待办：定时器的启动条件仍是桩（Classic 启用即运行），需收窄为「经典已连接 且 HID 有类在用或通话中」；
+   并在真机上确认 `kick=` 增长、`sniff` 为 0、手感与通话中一致
+2. **通话上行取走率 66–75%**：不是音质指标（§5.3）。现在 `mic rate` 是 100 次/秒、16000 B/s，
+   `amp` 正常，听感正常；`pull_out/pull_req` 的差额来自 AG 的 120 字节 × 5–7.5 ms 请求节奏
+3. **`SCO xmit Q overflow`**：通话中控制器同步 TX 队列持续溢出（改前 120 秒 720 次），部分丢包
+4. **麦克风双消费者**：USB 采集与 SCO 在直连模式下抢同一 I2S 流（当前 USB 未开，未暴露）
+5. **BLE 事件不派发**：`ESP_HIDD_*` 事件有时收不到，只能用轮询 `esp_hidd_dev_connected()` 兜底
+6. **显示长跑**：TE 合成路径在长时间运行后仍可能 `NO_MEM`（已用 `psram_dma_direct` 大幅缓解，未根除）
+7. **USB 运动接口在 Windows 上**：结构已合法（Report ID 在顶层集合内），但没有导出 `Unit` /
+   Feature 属性（Reporting State `0x0316`、Report Interval `0x030E`），Windows 传感器类驱动可能
+   拒绝绑定；Android/WebHID 侧按 report ID 4 读取，18 字节载荷
+8. **`app_usb_hid.c` 里的 `s_usb.report_map[512]`** 只写不读，属于死代码，可以删除

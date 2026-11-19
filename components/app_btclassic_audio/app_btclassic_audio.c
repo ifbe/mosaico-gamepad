@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "app_audio_codec.h"
+#include "app_bt_core.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,7 +20,6 @@
 #include "esp_gap_bt_api.h"
 #include "esp_hf_client_api.h"
 #include "esp_hf_client_legacy_api.h" /* esp_hf_client_outgoing_data_ready() */
-#include "esp_timer.h"
 #include "esp_pbac_api.h"
 
 #endif /* CONFIG_BT_ENABLED */
@@ -40,7 +40,6 @@ static bool s_started;
 static bool s_connected;      /* A2DP link */
 static bool s_paired;
 static int s_hfp_state = -1;   /* esp_hf_client_connection_state_t */
-static esp_timer_handle_t s_link_timer; /* keeps the ACL link out of sniff */
 /* Cumulative counters: a single status line then tells the whole story. */
 static int s_sco_attempts;
 static int s_sco_ok;
@@ -235,9 +234,6 @@ static uint32_t hfp_legacy_send(uint8_t *buf, uint32_t len)
 
 /* Forces the ACL link back to active mode; defined below with the explanation
  * of why a project-side call is needed at all. */
-static void force_link_active(void);
-static void link_active_timer_start(void);
-static void link_active_timer_stop(void);
 
 static void hfp_mic_task(void *arg)
 {
@@ -359,32 +355,10 @@ static void hfp_audio_data_cb(esp_hf_sync_conn_hdl_t handle, esp_hf_audio_buff_t
     esp_hf_client_audio_buff_free(audio_buf);
 }
 
-/* Bluedroid's own power management puts the ACL link into sniff, and the
- * controller then refuses the eSCO setup that carries call audio (log:
- * "OLM_CONN: pend list full on link:0, refuse proc_type:0x800d"), so the call
- * connects but no voice flows. There is no Kconfig and no public API to change
- * that policy, but the BTA power manager exports bta_dm_pm_active(), which
- * forces the link back to active mode. It has no public header, so declare it
- * here; see docs/gotcha.md section 4.3. */
-extern void bta_dm_pm_active(uint8_t peer_addr[6]);
-
-static void force_link_active(void)
-{
-    const int bonded = esp_bt_gap_get_bond_device_num();
-    if (bonded <= 0) {
-        return;
-    }
-    esp_bd_addr_t peers[4];
-    int count = bonded < (int)(sizeof(peers) / sizeof(peers[0]))
-                    ? bonded
-                    : (int)(sizeof(peers) / sizeof(peers[0]));
-    if (esp_bt_gap_get_bond_device_list(&count, peers) != ESP_OK) {
-        return;
-    }
-    for (int i = 0; i < count; ++i) {
-        bta_dm_pm_active(peers[i]);
-    }
-}
+/* The ACL-sniff countermeasure lives in app_bt_core: it owns the link, the
+ * peer address and the coalescing window, and the HID path needs it too. Here we
+ * only kick it at the moments where sniff would break call audio; see
+ * docs/gotcha.md section 4.3. */
 
 static void hfp_sco_start(void)
 {
@@ -449,11 +423,13 @@ static void bt_status_task(void *arg)
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));
+        unsigned kick_count = 0, kick_throttled = 0, kick_age_ms = 0;
+        app_bt_core_kick_stats(&kick_count, &kick_throttled, &kick_age_ms);
         ESP_LOGI(TAG,
                  "status: codec=%u paired=%d a2dp_link=%d a2dp_stream=%d hfp=%d sco=%d "
                  "sco_try=%d sco_ok=%d call=%d rx=%u tx=%u lx=%u lt=%u "
                  "mf=%u mfail=%u serr=%u lc=%u le=%u "
-                 "pull=%u/%u/%u/%u ready=%u mic=%u/%u peak=%u",
+                 "pull=%u/%u/%u/%u ready=%u mic=%u/%u peak=%u kick=%u/%u/%ums",
                  (unsigned)s_sco_rate, (int)s_paired, (int)s_connected,
                  (int)s_a2dp_streaming, s_hfp_state,
                  (int)s_sco_active, s_sco_attempts, s_sco_ok, s_call_status,
@@ -463,7 +439,8 @@ static void bt_status_task(void *arg)
                  (unsigned)s_pull_calls, (unsigned)s_pull_req_bytes,
                  (unsigned)s_pull_out_bytes, (unsigned)s_pull_empty,
                  (unsigned)s_ready_calls, (unsigned)s_mic_iters,
-                 (unsigned)s_mic_bytes, (unsigned)s_ring_peak);
+                 (unsigned)s_mic_bytes, (unsigned)s_ring_peak,
+                 kick_count, kick_throttled, kick_age_ms);
     }
 }
 
@@ -478,12 +455,12 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
          * silent. */
         if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
             memcpy(s_hfp_peer, param->conn_stat.remote_bda, sizeof(s_hfp_peer));
-            /* Keep this link out of sniff for as long as it is up: the eSCO
-             * setup at call time is refused otherwise. */
-            link_active_timer_start();
+            /* Remember the peer and take the link out of sniff right away: the
+             * eSCO setup at call time is refused while sniff is active. */
+            app_bt_core_note_classic_peer(param->conn_stat.remote_bda);
+            (void)app_bt_core_kick_acl_sniff();
             ESP_LOGI(TAG, "hfp ready (SCO is opened when a call is active)");
         } else if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
-            link_active_timer_stop();
             hfp_sco_stop();
         }
         break;
@@ -493,7 +470,7 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
          * Take the ACL link out of sniff first, otherwise the controller
          * refuses the eSCO setup and the call starts without voice. */
         if (!s_sco_active) {
-            force_link_active();
+            (void)app_bt_core_kick_acl_sniff();
             const esp_err_t aerr = esp_hf_client_connect_audio(s_hfp_peer);
             ESP_LOGI(TAG, "ringing, requesting SCO: %s", esp_err_to_name(aerr));
         }
@@ -502,7 +479,7 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
         s_call_status = (int)param->call.status;
         ESP_LOGI(TAG, "hfp call status %d", param->call.status);
         if (param->call.status != 0 && !s_sco_active) {
-            force_link_active();
+            (void)app_bt_core_kick_acl_sniff();
             const esp_err_t aerr = esp_hf_client_connect_audio(s_hfp_peer);
             ESP_LOGI(TAG, "call active, requesting SCO: %s", esp_err_to_name(aerr));
         }
@@ -520,16 +497,16 @@ static void hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *par
         if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTING) {
             /* Get the ACL link out of sniff before the controller tries to set
              * up the eSCO link; otherwise the request is refused. */
-            force_link_active();
+            (void)app_bt_core_kick_acl_sniff();
             ++s_sco_attempts;
         } else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED) {
             s_sco_rate = 8000; /* CVSD */
             ++s_sco_ok;
-            force_link_active();
+            (void)app_bt_core_kick_acl_sniff();
         } else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC) {
             s_sco_rate = 16000; /* mSBC wideband */
             ++s_sco_ok;
-            force_link_active();
+            (void)app_bt_core_kick_acl_sniff();
         }
         if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED ||
             state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC) {
@@ -570,49 +547,6 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         break;
     default:
         break;
-    }
-}
-
-/* Bluedroid keeps asking for sniff on this link (the headset power spec even
- * requests it while a SCO call is up), and the controller then refuses the eSCO
- * setup, so calls start without voice until a later retry. Stop the link from
- * sitting in sniff at all: while HFP is connected, poke the BTA power manager
- * once a second. */
-#define LINK_ACTIVE_PERIOD_US (1000 * 1000)
-
-static void link_active_timer_cb(void *arg)
-{
-    (void)arg;
-    if (s_hfp_state == (int)ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED) {
-        force_link_active();
-    }
-}
-
-static void link_active_timer_start(void)
-{
-    if (s_link_timer != NULL) {
-        return;
-    }
-    const esp_timer_create_args_t args = {
-        .callback = link_active_timer_cb,
-        .name = "link_active",
-    };
-    if (esp_timer_create(&args, &s_link_timer) != ESP_OK) {
-        ESP_LOGW(TAG, "link-active timer unavailable");
-        return;
-    }
-    if (esp_timer_start_periodic(s_link_timer, LINK_ACTIVE_PERIOD_US) != ESP_OK) {
-        (void)esp_timer_delete(s_link_timer);
-        s_link_timer = NULL;
-    }
-}
-
-static void link_active_timer_stop(void)
-{
-    if (s_link_timer != NULL) {
-        (void)esp_timer_stop(s_link_timer);
-        (void)esp_timer_delete(s_link_timer);
-        s_link_timer = NULL;
     }
 }
 
@@ -664,7 +598,6 @@ void app_btclassic_audio_stop(void)
     if (!s_started) {
         return;
     }
-    link_active_timer_stop();
     hfp_sco_stop();
     a2dp_stop_streaming();
     esp_hf_client_deinit();

@@ -7,11 +7,56 @@
 #include "esp_gap_bt_api.h"
 #include "esp_hidd.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "btclassic_hid";
 
 static esp_hidd_dev_t *s_dev;
 static bool s_connected;
+
+/* Apply the ACL poll interval once the link is out of sniff. The HID connect
+ * event carries no peer address, so use the one app_bt_core cached from the HFP
+ * stack-up event, falling back to the first bonded device. */
+#define HID_QOS_DELAY_MS 200
+#define HID_QOS_POLL 20 /* 12.5 ms */
+
+static esp_timer_handle_t s_qos_timer;
+
+static void qos_apply(void *arg)
+{
+    (void)arg;
+    uint8_t peer[6];
+    if (!app_bt_core_classic_peer(peer)) {
+        const int bonded = esp_bt_gap_get_bond_device_num();
+        esp_bd_addr_t list[1];
+        int count = bonded > 0 ? 1 : 0;
+        if (count == 0 || esp_bt_gap_get_bond_device_list(&count, list) != ESP_OK) {
+            ESP_LOGW(TAG, "no peer for QoS");
+            return;
+        }
+        memcpy(peer, list[0], sizeof(peer));
+    }
+    const esp_err_t err = esp_bt_gap_set_qos(peer, HID_QOS_POLL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "qos: %s", esp_err_to_name(err));
+    }
+}
+
+static void schedule_qos(void)
+{
+    if (s_qos_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = qos_apply,
+            .name = "hid_qos",
+        };
+        if (esp_timer_create(&args, &s_qos_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "qos timer unavailable");
+            return;
+        }
+    }
+    (void)esp_timer_stop(s_qos_timer);
+    (void)esp_timer_start_once(s_qos_timer, HID_QOS_DELAY_MS * 1000);
+}
 
 static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_t id,
                                void *event_data)
@@ -23,20 +68,14 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
     case ESP_HIDD_CONNECT_EVENT: {
         s_connected = true;
         ESP_LOGI(TAG, "host connected");
-        /* Keep the ACL poll interval short so reports stay prompt. The event
-         * carries no peer address, so apply it to the bonded peers (there is
-         * exactly one in practice). This replaces the previous patch inside
-         * esp_hid/src/bt_hidd.c and keeps the IDF checkout untouched. */
-        const int bonded = esp_bt_gap_get_bond_device_num();
-        esp_bd_addr_t peers[4];
-        int count = bonded < (int)(sizeof(peers) / sizeof(peers[0]))
-                        ? bonded
-                        : (int)(sizeof(peers) / sizeof(peers[0]));
-        if (count > 0 && esp_bt_gap_get_bond_device_list(&count, peers) == ESP_OK) {
-            for (int i = 0; i < count; ++i) {
-                (void)esp_bt_gap_set_qos(peers[i], 20);
-            }
-        }
+        /* Bluedroid asks for sniff on this link after every report, so take it
+         * out of sniff now and let app_bt_core's periodic kick keep it out. */
+        (void)app_bt_core_kick_acl_sniff();
+        /* Short ACL poll interval keeps reports prompt. It has to be applied to
+         * the connected peer only, and only once the link is active again: the
+         * controller rejects HCI_QoS_Setup with 0x02 (invalid parameters) while
+         * the link is still in sniff or not fully up, so defer it briefly. */
+        schedule_qos();
         break;
     }
     case ESP_HIDD_DISCONNECT_EVENT:

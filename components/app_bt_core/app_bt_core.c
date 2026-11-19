@@ -15,6 +15,8 @@
 #include "esp_gap_ble_api.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 
 static const char *TAG = "app_bt_core";
 
@@ -26,6 +28,175 @@ static const char *TAG = "app_bt_core";
 
 static bool s_ready;
 static app_bt_mode_t s_mode = APP_BT_OFF;
+
+/* ---------------------------------------------------------- sniff kicking --- */
+
+/* Bluedroid's own power management pushes the ACL link into sniff, and the
+ * controller then delays or refuses whatever shares that link: HID reports wait
+ * a sniff-to-active round trip (~40-50 ms), and the eSCO setup for a call is
+ * rejected outright ("OLM_CONN: pend list full ... proc_type:0x800d").
+ * bta_dm_pm_active() is the exported BTA entry that forces the link back to
+ * active. It has no public header, so declare it here; see docs/gotcha.md. */
+extern void bta_dm_pm_active(uint8_t peer_addr[6]);
+
+/* Coalescing window: several callers (8 ms HID task, 100 Hz mic task, the
+ * periodic timer below) collapse into at most one HCI command per second. */
+#define APP_BT_KICK_MIN_INTERVAL_US (1000 * 1000)
+
+static portMUX_TYPE s_kick_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_last_kick_us;
+static unsigned s_kick_count;
+static unsigned s_kick_throttled;
+static uint8_t s_classic_peer[6];
+static bool s_classic_peer_known;
+static esp_timer_handle_t s_kick_timer;
+
+void app_bt_core_note_classic_peer(const uint8_t bda[6])
+{
+    if (bda == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_kick_mux);
+    memcpy(s_classic_peer, bda, sizeof(s_classic_peer));
+    s_classic_peer_known = true;
+    portEXIT_CRITICAL(&s_kick_mux);
+}
+
+bool app_bt_core_classic_peer(uint8_t out[6])
+{
+    if (out == NULL) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_kick_mux);
+    const bool known = s_classic_peer_known;
+    if (known) {
+        memcpy(out, s_classic_peer, sizeof(s_classic_peer));
+    }
+    portEXIT_CRITICAL(&s_kick_mux);
+    return known;
+}
+
+/* Kick one peer address. Returns how many peers were kicked. */
+static unsigned kick_peer(uint8_t bda[6])
+{
+    bta_dm_pm_active(bda);
+    return 1;
+}
+
+bool app_bt_core_kick_acl_sniff(void)
+{
+    if (!app_bt_core_wants_classic()) {
+        return false;
+    }
+
+    /* Claim the window first, in one critical section: two tasks arriving
+     * together must not both kick, and the timestamp has to be set exactly once
+     * per window. */
+    const int64_t now = esp_timer_get_time();
+    bool claimed = false;
+    uint8_t peer[6];
+    bool peer_known;
+    portENTER_CRITICAL(&s_kick_mux);
+    if ((now - s_last_kick_us) >= APP_BT_KICK_MIN_INTERVAL_US) {
+        s_last_kick_us = now;
+        claimed = true;
+    } else {
+        ++s_kick_throttled;
+    }
+    peer_known = s_classic_peer_known;
+    memcpy(peer, s_classic_peer, sizeof(peer));
+    portEXIT_CRITICAL(&s_kick_mux);
+    if (!claimed) {
+        return false;
+    }
+
+    unsigned kicked = 0;
+    if (peer_known) {
+        kicked = kick_peer(peer);
+    } else {
+        /* The classic HID connect event carries no peer address, so fall back to
+         * the bond database until a profile reports one. */
+        const int bonded = esp_bt_gap_get_bond_device_num();
+        esp_bd_addr_t peers[4];
+        int count = bonded < (int)(sizeof(peers) / sizeof(peers[0]))
+                        ? bonded
+                        : (int)(sizeof(peers) / sizeof(peers[0]));
+        if (count > 0 && esp_bt_gap_get_bond_device_list(&count, peers) == ESP_OK) {
+            for (int i = 0; i < count; ++i) {
+                kicked += kick_peer(peers[i]);
+            }
+        }
+    }
+    if (kicked == 0) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_kick_mux);
+    ++s_kick_count;
+    portEXIT_CRITICAL(&s_kick_mux);
+    return true;
+}
+
+void app_bt_core_kick_stats(unsigned *kicks, unsigned *throttled, unsigned *age_ms)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_kick_mux);
+    if (kicks != NULL) {
+        *kicks = s_kick_count;
+    }
+    if (throttled != NULL) {
+        *throttled = s_kick_throttled;
+    }
+    if (age_ms != NULL) {
+        *age_ms = s_kick_count == 0 ? 0 : (unsigned)((now - s_last_kick_us) / 1000);
+    }
+    portEXIT_CRITICAL(&s_kick_mux);
+}
+
+/* The periodic kick runs while the Classic link can be carrying something the
+ * user notices: HID input or call audio.
+ *
+ * TODO: narrow this to the real condition - "Classic ACL connected AND (a HID
+ * class is enabled/connected OR a call is actually up)". The components that
+ * know those states live above app_bt_core, so for now the timer runs whenever
+ * Classic is enabled and simply finds no peer to kick until one bonds. */
+static bool acl_kick_needed(void)
+{
+    return app_bt_core_wants_classic();
+}
+
+static void kick_timer_cb(void *arg)
+{
+    (void)arg;
+    if (acl_kick_needed()) {
+        (void)app_bt_core_kick_acl_sniff();
+    }
+}
+
+static void kick_timer_apply(void)
+{
+    const bool needed = acl_kick_needed();
+    if (needed && s_kick_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = kick_timer_cb,
+            .name = "bt_acl_kick",
+        };
+        if (esp_timer_create(&args, &s_kick_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "ACL kick timer unavailable");
+            return;
+        }
+        if (esp_timer_start_periodic(s_kick_timer, APP_BT_KICK_MIN_INTERVAL_US) != ESP_OK) {
+            (void)esp_timer_delete(s_kick_timer);
+            s_kick_timer = NULL;
+        }
+        return;
+    }
+    if (!needed && s_kick_timer != NULL) {
+        (void)esp_timer_stop(s_kick_timer);
+        (void)esp_timer_delete(s_kick_timer);
+        s_kick_timer = NULL;
+    }
+}
 
 static esp_err_t controller_start(app_bt_mode_t mode)
 {
@@ -89,6 +260,7 @@ esp_err_t app_bt_core_start(void)
         classic_identity();
     }
     s_ready = true;
+    kick_timer_apply();
     ESP_LOGI(TAG, "ready (mode %s)", app_cfg_bt_mode_name(s_mode));
     return ESP_OK;
 }
@@ -122,10 +294,13 @@ const char *app_bt_core_classic_name(void)
 
 /* The report descriptors live in app_usb_core; the Bluetooth map is assembled
  * here from the subset selected by the persisted bt_hid mask. */
-/* The two transports have independent class masks, so each gets its own map. */
-static uint8_t s_report_map_ble[192];
+/* The two transports have independent class masks, so each gets its own map.
+ * Budget: gamepad 50 + mouse 69 + keyboard 47 + motion 58 = 224 bytes, so 256
+ * leaves room for the descriptors to grow (the motion descriptor grew from 22
+ * to 58 bytes when it moved to standard HID Sensors usages). */
+static uint8_t s_report_map_ble[256];
 static size_t s_report_map_ble_len;
-static uint8_t s_report_map_bt[192];
+static uint8_t s_report_map_bt[256];
 static size_t s_report_map_bt_len;
 
 static size_t build_report_map(uint32_t mask, uint8_t *out, size_t cap)
@@ -141,7 +316,12 @@ static size_t build_report_map(uint32_t mask, uint8_t *out, size_t cap)
         }
         size_t len = 0;
         const uint8_t *desc = app_usb_hid_class_desc(i, &len);
-        if (desc == NULL || used + len > cap) {
+        if (desc == NULL) {
+            continue;
+        }
+        if (used + len > cap) {
+            ESP_LOGE(TAG, "report map full: class %u needs %u B, only %u free",
+                     (unsigned)i, (unsigned)len, (unsigned)(cap - used));
             continue;
         }
         memcpy(&out[used], desc, len);
@@ -150,9 +330,14 @@ static size_t build_report_map(uint32_t mask, uint8_t *out, size_t cap)
     if ((mask & APP_CLASS_SENSOR) != 0) {
         size_t len = 0;
         const uint8_t *desc = app_usb_hid_sensor_desc(&len);
-        if (desc != NULL && used + len <= cap) {
-            memcpy(&out[used], desc, len);
-            used += len;
+        if (desc != NULL) {
+            if (used + len > cap) {
+                ESP_LOGE(TAG, "report map full: motion needs %u B, only %u free",
+                         (unsigned)len, (unsigned)(cap - used));
+            } else {
+                memcpy(&out[used], desc, len);
+                used += len;
+            }
         }
     }
     return used;
