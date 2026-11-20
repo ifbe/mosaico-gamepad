@@ -16,11 +16,12 @@ the RPC service `0x4700` change them; a reboot applies the change.
 
 ## Screen
 
-Six pages: idle, mouse, keyboard, gamepad, terminal, settings. The BOOT key or
+Seven pages: idle, mouse, keyboard, gamepad, sensor, terminal, settings. The BOOT key or
 the layout RPC switches pages. Touch drives pointer, keyboard and gamepad input;
 the gamepad page adds LB/RB, LS/RS, SELECT/START and analog LT/RT sliders around
-the two sticks. The settings page toggles the class masks for USB, Classic
-Bluetooth and BLE.
+the two sticks. The sensor page shows the live gyro/accelerometer/magnetometer
+values and can turn device rotation into mouse movement. The settings page
+toggles the class masks for USB, Classic Bluetooth and BLE.
 
 ## Build and install
 

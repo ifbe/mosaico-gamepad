@@ -14,6 +14,7 @@
 
 #include "app_cfg.h"
 #include "app_ui.h"
+#include "app_sensor.h"
 #include "app_usb_hid.h"
 
 #include "esp_check.h"
@@ -288,7 +289,8 @@ static void cycle_layout(void)
 {
     static const app_ui_layout_t pages[] = {
         APP_UI_LAYOUT_BLANK, APP_UI_LAYOUT_MOUSE, APP_UI_LAYOUT_KEYBOARD,
-        APP_UI_LAYOUT_GAMEPAD, APP_UI_LAYOUT_TERMINAL, APP_UI_LAYOUT_SETTING,
+        APP_UI_LAYOUT_GAMEPAD, APP_UI_LAYOUT_SENSOR, APP_UI_LAYOUT_TERMINAL,
+        APP_UI_LAYOUT_SETTING,
     };
     const app_ui_layout_t current = app_ui_layout();
     size_t next = 0;
@@ -877,6 +879,180 @@ static void overlay_tick(void)
     s_overlay.released = false;
 }
 
+/* ---------------------------------------------------------- sensor page --- */
+
+/* Layout of the sensor page controls in scene pixels (must match ui/main.json). */
+#define SENSOR_CLICK_Y 272
+#define SENSOR_CLICK_W 176
+#define SENSOR_CLICK_H 64
+#define SENSOR_CLICK_L_X 48
+#define SENSOR_CLICK_R_X 256
+#define SENSOR_TOGGLE_X 48
+#define SENSOR_TOGGLE_Y 356
+#define SENSOR_TOGGLE_W 384
+#define SENSOR_TOGGLE_H 64
+
+/* Values refresh about 10 Hz: faster only floods the GSP render queue. */
+#define SENSOR_LINE_DIV 6
+/* Gyro noise at rest is about +-5 (0.5 deg/s); below this the pointer must not
+ * drift. */
+#define SENSOR_DEADZONE 20
+/* Pointer speed: rate is in 0.1 deg/s, px/s = rate * 20 / 10, i.e. a wrist
+ * turn of 100 deg/s moves about 2000 px/s. Remainder is kept in 1/1000 px. */
+#define SENSOR_PX_NUM 20
+#define SENSOR_PX_DEN 10
+
+static bool s_sensor_mouse;
+static bool s_sensor_btn_shown;
+/* Mouse buttons held on this page, one bit each (bit0 left, bit1 right), plus
+ * which button each contact grabbed so the right one releases. */
+static uint8_t s_sensor_click;
+static int8_t s_sensor_grab[TOUCH_MAX_POINTS] = {-1, -1};
+/* GSP setters queue to the render task and can time out while it is busy (seen
+ * as 0x107 right after a page switch), so repaint the button once more on the
+ * next tick instead of leaving a stale highlight. */
+static bool s_sensor_visual_dirty;
+static unsigned s_sensor_div;
+static int32_t s_sensor_rem_x;
+static int32_t s_sensor_rem_y;
+
+static bool sensor_mouse_available(void)
+{
+    const uint32_t masks = app_cfg_classes() | app_cfg_bt_hid() | app_cfg_ble_hid();
+    return (masks & APP_CLASS_MOUSE) != 0;
+}
+
+/* Turn one gyro axis into whole pointer pixels, keeping the sub-pixel rest. */
+static int32_t sensor_axis_to_pixels(int32_t rate, int32_t *remainder)
+{
+    if (rate > -SENSOR_DEADZONE && rate < SENSOR_DEADZONE) {
+        return 0;
+    }
+    *remainder += rate * INPUT_PERIOD_MS * SENSOR_PX_NUM / SENSOR_PX_DEN;
+    int32_t px = *remainder / 1000;
+    *remainder -= px * 1000;
+    if (px > 127) {
+        px = 127; /* the report field is a signed byte */
+    } else if (px < -127) {
+        px = -127;
+    }
+    return px;
+}
+
+static void sensor_set_mouse(bool on)
+{
+    if (s_sensor_mouse == on) {
+        return;
+    }
+    s_sensor_mouse = on;
+    s_sensor_rem_x = 0;
+    s_sensor_rem_y = 0;
+    s_sensor_visual_dirty = true;
+    app_ui_set_sensor_toggle(on);
+    ESP_LOGI(TAG, "gyro mouse %s", on ? "on" : "off");
+}
+
+static void sensor_update(void)
+{
+    app_sensor_sample_t sample;
+    if (s_sensor_visual_dirty) {
+        s_sensor_visual_dirty = false;
+        app_ui_set_sensor_button_visible(s_sensor_btn_shown);
+        app_ui_set_sensor_toggle(s_sensor_mouse);
+    }
+    if (!app_sensor_latest(&sample)) {
+        return;
+    }
+    if (++s_sensor_div >= SENSOR_LINE_DIV) {
+        s_sensor_div = 0;
+        char line[48];
+        snprintf(line, sizeof(line), "gyro  %+5d %+5d %+5d",
+                 (int)sample.gyro[0], (int)sample.gyro[1], (int)sample.gyro[2]);
+        app_ui_set_sensor_line(0, line);
+        snprintf(line, sizeof(line), "accl  %+5d %+5d %+5d",
+                 (int)sample.accel[0], (int)sample.accel[1], (int)sample.accel[2]);
+        app_ui_set_sensor_line(1, line);
+        if (sample.mag_valid) {
+            snprintf(line, sizeof(line), "mag   %+5d %+5d %+5d",
+                     (int)sample.mag[0], (int)sample.mag[1], (int)sample.mag[2]);
+        } else {
+            snprintf(line, sizeof(line), "mag     n/a");
+        }
+        app_ui_set_sensor_line(2, line);
+    }
+
+    if (!s_sensor_mouse) {
+        return;
+    }
+    /* yaw (Z) drives the horizontal axis, pitch (X) the vertical one. Both are
+     * negated: on the bench a positive rate moves the cursor the other way. */
+    const int32_t dx = sensor_axis_to_pixels(-sample.gyro[2], &s_sensor_rem_x);
+    const int32_t dy = sensor_axis_to_pixels(-sample.gyro[0], &s_sensor_rem_y);
+    if (dx != 0 || dy != 0) {
+        app_usb_hid_mouse(s_sensor_click, (int8_t)dx, (int8_t)dy, 0, 0);
+    }
+}
+
+/* Which mouse button a point lands on: 0 left, 1 right, -1 none. */
+static int sensor_click_at(int32_t x, int32_t y)
+{
+    if (y < SENSOR_CLICK_Y || y >= SENSOR_CLICK_Y + SENSOR_CLICK_H) {
+        return -1;
+    }
+    if (x >= SENSOR_CLICK_L_X && x < SENSOR_CLICK_L_X + SENSOR_CLICK_W) {
+        return 0;
+    }
+    if (x >= SENSOR_CLICK_R_X && x < SENSOR_CLICK_R_X + SENSOR_CLICK_W) {
+        return 1;
+    }
+    return -1;
+}
+
+static void sensor_publish_click(void)
+{
+    app_usb_hid_mouse(s_sensor_click, 0, 0, 0, 0);
+}
+
+/* Press/release one mouse button; two contacts may hold both at once. */
+static void sensor_click_hold(int contact, int button, bool down)
+{
+    if (down) {
+        s_sensor_grab[contact] = (int8_t)button;
+        s_sensor_click |= (uint8_t)(1u << button);
+        app_ui_set_sensor_click((unsigned)button, true);
+    } else {
+        const int8_t held = s_sensor_grab[contact];
+        s_sensor_grab[contact] = -1;
+        if (held >= 0) {
+            s_sensor_click &= (uint8_t)~(1u << held);
+            app_ui_set_sensor_click((unsigned)held, false);
+        }
+    }
+    sensor_publish_click();
+}
+
+static void sensor_release_clicks(void)
+{
+    for (int i = 0; i < TOUCH_MAX_POINTS; ++i) {
+        if (s_sensor_grab[i] >= 0) {
+            sensor_click_hold(i, s_sensor_grab[i], false);
+        }
+    }
+}
+
+/* Tap on the gyro-mouse bar toggles the mode. */
+static void sensor_tap(int32_t x, int32_t y)
+{
+    if (!s_sensor_btn_shown || !sensor_mouse_available()) {
+        return;
+    }
+    if (x < SENSOR_TOGGLE_X || x >= SENSOR_TOGGLE_X + SENSOR_TOGGLE_W ||
+        y < SENSOR_TOGGLE_Y || y >= SENSOR_TOGGLE_Y + SENSOR_TOGGLE_H) {
+        return;
+    }
+    sensor_set_mouse(!s_sensor_mouse);
+}
+
 static void on_input_event(const app_input_event_t *event)
 {
     if (event->type >= APP_INPUT_KEY_DOWN) {
@@ -890,10 +1066,21 @@ static void on_input_event(const app_input_event_t *event)
                                 .active = event->type != APP_INPUT_TOUCH_UP};
     s_overlay.changed = true;
     if (event->type == APP_INPUT_TOUCH_DOWN) {
+        if (app_ui_layout() == APP_UI_LAYOUT_SENSOR) {
+            const int button = sensor_click_at(event->x, event->y);
+            if (button >= 0) {
+                sensor_click_hold(id, button, true);
+            } else if (id == 0) {
+                sensor_tap(event->x, event->y);
+            }
+        }
         /* Latch the control this contact landed on; a later slide must not hand
          * the contact over to the stick underneath. */
         s_in.capture[id] = side_at(event->x, event->y);
     } else if (event->type == APP_INPUT_TOUCH_UP) {
+        if (app_ui_layout() == APP_UI_LAYOUT_SENSOR && s_sensor_grab[id] >= 0) {
+            sensor_click_hold(id, s_sensor_grab[id], false);
+        }
         s_in.capture[id] = SIDE_NONE;
         s_overlay.released = true;
     }
@@ -918,6 +1105,9 @@ static void input_task(void *arg)
         case APP_UI_LAYOUT_KEYBOARD:
             keyboard_update();
             break;
+        case APP_UI_LAYOUT_SENSOR:
+            sensor_update();
+            break;
         case APP_UI_LAYOUT_SETTING:
             settings_update();
             break;
@@ -928,6 +1118,20 @@ static void input_task(void *arg)
         if (layout != s_last_layout) {
             if (s_last_layout == APP_UI_LAYOUT_GAMEPAD) {
                 gamepad_release_all();
+            }
+            if (s_last_layout == APP_UI_LAYOUT_SENSOR) {
+                /* The switch and the mouse buttons belong to this page only. */
+                sensor_release_clicks();
+                sensor_set_mouse(false);
+            }
+            if (layout == APP_UI_LAYOUT_SENSOR) {
+                s_sensor_btn_shown = sensor_mouse_available();
+                s_sensor_visual_dirty = true;
+                app_ui_set_sensor_button_visible(s_sensor_btn_shown);
+                s_sensor_div = SENSOR_LINE_DIV;
+                ESP_LOGI(TAG, "sensor page%s", s_sensor_btn_shown ? "" : " (no mouse class)");
+            } else {
+                s_sensor_btn_shown = false;
             }
             s_last_layout = layout;
         }

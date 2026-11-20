@@ -37,6 +37,10 @@ esp_err_t app_sensor_start(void);
  */
 bool app_sensor_read(app_sensor_sample_t *out);
 
+/** Copy the newest sample without consuming it. Use this when a second reader
+ * must not steal freshness from the motion report path. */
+bool app_sensor_latest(app_sensor_sample_t *out);
+
 #ifdef __cplusplus
 }
 #endif

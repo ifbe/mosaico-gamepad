@@ -24,7 +24,7 @@
 | `app_ui_touch` | 只做设备：CST9220 轮询 + BOOT 键 → `app_input_event_t` 事件队列 |
 | `app_log` | 自己的日志环形缓冲（供终端页） |
 
-布局枚举：`blank / gamepad / mouse / keyboard / terminal / setting`，只靠 BOOT 键循环与 RPC 切换
+布局枚举：`blank / gamepad / mouse / keyboard / sensor / terminal / setting`，只靠 BOOT 键循环与 RPC 切换
 （屏幕四角切换已移除）。手柄页在摇杆两侧各有 LB/LS/SELECT/LT 与镜像的 RB/RS/START/RT，布局见 `docs/app_ui.md`。
 
 ---

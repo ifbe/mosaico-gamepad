@@ -67,6 +67,13 @@ static esp_gsp_err_t (*const s_term_set_text[TERMINAL_LINES])(esp_gsp_handle_t, 
     gsp_gamepad_term_29_set_text,
 };
 
+#define SENSOR_LINES 3
+static esp_gsp_err_t (*const s_sensor_set_text[SENSOR_LINES])(esp_gsp_handle_t, const char *) = {
+    gsp_gamepad_sensor_0_set_text,
+    gsp_gamepad_sensor_1_set_text,
+    gsp_gamepad_sensor_2_set_text,
+};
+
 /* Chip label colours: the cyan fill needs dark text, an unselected chip keeps
  * the light label. There is no third "blocked" look: a chip is either selected
  * or not. */
@@ -87,6 +94,7 @@ struct app_ui {
     void *timer;
     int32_t marquee_pos;   /* distance travelled along the perimeter, px */
     app_ui_layout_t layout;
+    bool sensor_mouse;      /* gyro-mouse button state, sensor page only */
     esp_gsp_err_t last_error;
 };
 
@@ -271,6 +279,48 @@ void app_ui_set_stick_knob(bool left, int32_t x, int32_t y)
         x, y));
 }
 
+void app_ui_set_sensor_line(unsigned line, const char *text)
+{
+    if (line >= SENSOR_LINES || s_app.gsp == NULL || text == NULL) {
+        return;
+    }
+    remember(s_sensor_set_text[line](s_app.gsp, text));
+}
+
+void app_ui_set_sensor_button_visible(bool visible)
+{
+    if (s_app.gsp == NULL) {
+        return;
+    }
+    remember(gsp_gamepad_sensor_toggle_set_visible(s_app.gsp, visible));
+    remember(gsp_gamepad_sensor_toggle_on_set_visible(s_app.gsp, visible && s_app.sensor_mouse));
+}
+
+void app_ui_set_sensor_toggle(bool on)
+{
+    if (s_app.gsp == NULL) {
+        return;
+    }
+    s_app.sensor_mouse = on;
+    remember(gsp_gamepad_sensor_toggle_on_set_visible(s_app.gsp, on));
+    remember(gsp_gamepad_sensor_toggle_text_set_text(s_app.gsp, on ? "GYRO MOUSE  ON" : "GYRO MOUSE  OFF"));
+    const uint32_t rgb = on ? 0x101010u : 0xE0E0E0u;
+    remember(esp_gsp_component_set_color_rgb888(s_app.gsp, GSP_GAMEPAD_OBJ_KEY_SENSOR_TOGGLE_TEXT, rgb));
+}
+
+void app_ui_set_sensor_click(unsigned button, bool pressed)
+{
+    if (button > 1 || s_app.gsp == NULL) {
+        return;
+    }
+    const gsp_component_key_t text = button == 0 ? GSP_GAMEPAD_OBJ_KEY_SENSOR_BTN_L_TEXT
+                                                 : GSP_GAMEPAD_OBJ_KEY_SENSOR_BTN_R_TEXT;
+    remember(button == 0 ? gsp_gamepad_sensor_btn_l_on_set_visible(s_app.gsp, pressed)
+                         : gsp_gamepad_sensor_btn_r_on_set_visible(s_app.gsp, pressed));
+    remember(esp_gsp_component_set_color_rgb888(s_app.gsp, text,
+                                                pressed ? 0x101010u : 0xE0E0E0u));
+}
+
 void app_ui_set_terminal_line(unsigned line, const char *text)
 {
     if (line >= TERMINAL_LINES || s_app.gsp == NULL || text == NULL) {
@@ -285,6 +335,7 @@ const char *app_ui_layout_name(app_ui_layout_t layout)
     case APP_UI_LAYOUT_GAMEPAD: return "gamepad";
     case APP_UI_LAYOUT_MOUSE: return "mouse";
     case APP_UI_LAYOUT_KEYBOARD: return "keyboard";
+    case APP_UI_LAYOUT_SENSOR: return "sensor";
     case APP_UI_LAYOUT_TERMINAL: return "terminal";
     case APP_UI_LAYOUT_SETTING: return "setting";
     default: return "blank";
@@ -315,6 +366,7 @@ void app_ui_set_layout(app_ui_layout_t layout)
     remember(gsp_gamepad_layer_gamepad_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_GAMEPAD));
     remember(gsp_gamepad_layer_mouse_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_MOUSE));
     remember(gsp_gamepad_layer_keyboard_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_KEYBOARD));
+    remember(gsp_gamepad_layer_sensor_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_SENSOR));
     remember(gsp_gamepad_layer_terminal_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_TERMINAL));
     /* Link state labels belong to the idle screen only. */
     remember(gsp_gamepad_layer_setting_set_visible(s_app.gsp,

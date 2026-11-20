@@ -140,8 +140,9 @@ app_ui_core/app_ui.c (渲染任务, 40 ms)
 
 ## 六、页面与布局
 
-页面：`blank`（idle）/ `mouse` / `keyboard` / `gamepad` / `terminal` / `setting`，
-同一时刻只显示一层。切页只有 BOOT 键与 RPC，**屏幕四角不再切页**。
+页面：`blank`（idle）/ `mouse` / `keyboard` / `gamepad` / `sensor` / `terminal` /
+`setting`，同一时刻只显示一层。切页只有 BOOT 键与 RPC（BOOT 循环顺序即此顺序），
+**屏幕四角不再切页**。
 
 ### 6.1 手势与页面语义
 
@@ -150,6 +151,7 @@ app_ui_core/app_ui.c (渲染任务, 40 ms)
 | mouse | 相对移动光标；单指轻点（<200 ms、位移 <8 px）= 左键；双指轻点 = 右键；双指上下滑动 = 滚轮 + 横移 |
 | keyboard | 12×5 键表，最多两触点，发 8 字节报告 |
 | gamepad | 双摇杆、十字键、ABXY，外加 §6.2 的八个侧控 |
+| sensor | 三行 gyro/accl/mag 实时值 + 底部陀螺仪鼠标开关，见 §6.3 |
 | setting | 三段（usb / bt / ble）各一个 `[default]`，芯片点击写 `app_cfg`（重启生效） |
 | terminal | `app_log` 最新 30 行，4 Hz 刷新 |
 
@@ -181,7 +183,48 @@ app_ui_core/app_ui.c (渲染任务, 40 ms)
 - 离开手柄页时 `gamepad_release_all()`：按键清零、摇杆回中、扳机回 0、发光层全灭
 - 扳机只在 0 ↔ 非 0 边沿打日志（`trigger L=… R=…`）
 
-### 6.3 设置页语义
+### 6.3 传感器页与陀螺仪鼠标
+
+页面从上到下：`SENSOR` 标题、三行数值（`gyro` 0.1 °/s、`accl` mg、`mag` 0.1 µT，X/Y/Z 整数，
+约 10 Hz 刷新，没有磁力计时第三行显示 `n/a`）、单位提示、**左/右键**、**GYRO MOUSE 开关**。
+所有坐标与 `ui/main.json` 一致：
+
+| 控件 | 位置（x,y,w,h） | 行为 |
+| --- | --- | --- |
+| `LEFT` | 48, 272, 176, 64 | 按下即报左键，抬起释放；按下时青底深字 |
+| `RIGHT` | 256, 272, 176, 64 | 同上，右键 |
+| `GYRO MOUSE` | 48, 356, 384, 64 | 点一次开、再点关；开=青底深字 + `GYRO MOUSE  ON` |
+
+按键细节：
+
+- **两指可以同时按住 L 和 R**：每个触点用 `s_sensor_grab[]` 记住自己抓的是哪个键，抬起只释放自己那个
+- **拖拽不丢键**：陀螺仪位移上报时把当前按键位一起带上（`app_usb_hid_mouse(s_sensor_click, dx, dy, …)`），
+  所以按住 LEFT 转动手腕就是拖动
+- 按键与 gyro 开关**互相独立**：开关关着也能当普通鼠标键用
+- 离开页面 `sensor_release_clicks()` + `sensor_set_mouse(false)`，不会把键卡住
+
+开关细节：
+
+- **只在有鼠标类可用时显示**：判定 `(usb_hid | bt_hid | ble_hid) & APP_CLASS_MOUSE`；
+  否则整块隐藏，日志打 `sensor page (no mouse class)`
+- 状态**不持久化**，且**离开该页自动关闭**
+- 打开后把转动变成指针位移，走 `app_usb_hid_mouse()`，USB / 经典蓝牙 / BLE 哪个连着就发给哪个
+
+映射与手感参数（`app_ui_input.c`）：
+
+| 项 | 值 |
+| --- | --- |
+| 轴映射 | `gyro Z → 光标 X`，`gyro X → 光标 Y`，两轴都取负（`dx = -gyro_z`、`dy = -gyro_x`） |
+| 灵敏度 | `px/s = rate(0.1 °/s) × 2.0`，即 100 °/s ≈ 2000 px/s（`SENSOR_PX_NUM 20`） |
+| 死区 | ±20（2 °/s）以内不产生位移，静止不漂 |
+| 余数 | 不足 1 px 的部分留在 1/1000 px 累加器里，慢速移动也不丢 |
+| 单次增量 | 钳位 ±127（报文是 int8） |
+
+数值来源是 `app_sensor_latest()`：它**不消费**新鲜度，因此不会和 16 ms 的报文路径抢采样。
+页面与运动报文互不影响：运动接口（report ID 4）在任何页面都以 ~62 Hz 持续上报，
+陀螺仪鼠标只是**额外**的消费者。
+
+### 6.4 设置页语义
 
 | 点击 | 结果 |
 | --- | --- |

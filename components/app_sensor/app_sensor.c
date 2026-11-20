@@ -112,6 +112,20 @@ esp_err_t app_sensor_start(void)
     return ESP_OK;
 }
 
+bool app_sensor_latest(app_sensor_sample_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    taskENTER_CRITICAL(&s_lock);
+    const bool valid = s_sequence != 0;
+    if (valid) {
+        *out = s_sample;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    return valid;
+}
+
 bool app_sensor_read(app_sensor_sample_t *out)
 {
     static uint32_t seen;

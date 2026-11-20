@@ -18,6 +18,7 @@ typedef enum {
     APP_UI_LAYOUT_GAMEPAD,
     APP_UI_LAYOUT_MOUSE,
     APP_UI_LAYOUT_KEYBOARD,
+    APP_UI_LAYOUT_SENSOR,
     APP_UI_LAYOUT_TERMINAL,
     APP_UI_LAYOUT_SETTING,
     APP_UI_LAYOUT_COUNT
@@ -74,6 +75,20 @@ void app_ui_set_dpad_glow(unsigned direction, bool on);
 
 /** Move a stick knob; coordinates are the knob's top-left corner in scene px. */
 void app_ui_set_stick_knob(bool left, int32_t x, int32_t y);
+
+/** Replace one sensor page value line: 0 gyro, 1 accel, 2 magnetometer. */
+void app_ui_set_sensor_line(unsigned line, const char *text);
+
+/** Show/hide the gyro-mouse button on the sensor page. Hidden when no enabled
+ * transport exposes a mouse class. */
+void app_ui_set_sensor_button_visible(bool visible);
+
+/** Paint the gyro-mouse button on (cyan) or off. */
+void app_ui_set_sensor_toggle(bool on);
+
+/** Highlight (cyan fill + dark text) one of the sensor page mouse buttons:
+ * 0 left, 1 right. */
+void app_ui_set_sensor_click(unsigned button, bool pressed);
 
 /** Replace one terminal line (0..29). */
 void app_ui_set_terminal_line(unsigned line, const char *text);
