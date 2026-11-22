@@ -149,11 +149,34 @@ app_ui_core/app_ui.c (渲染任务, 40 ms)
 | 页面 | 行为 |
 | --- | --- |
 | mouse | 相对移动光标；单指轻点（<200 ms、位移 <8 px）= 左键；双指轻点 = 右键；双指上下滑动 = 滚轮 + 横移 |
-| keyboard | 12×5 键表，最多两触点，发 8 字节报告 |
+| keyboard | 顶部 `VOL-`/`VOL+` 两个大按钮 + 12×5 键表，最多两触点，发 8 字节报告 |
 | gamepad | 双摇杆、十字键、ABXY，外加 §6.2 的八个侧控 |
 | sensor | 三行 gyro/accl/mag 实时值 + 底部陀螺仪鼠标开关，见 §6.3 |
 | setting | 三段（usb / bt / ble）各一个 `[default]`，芯片点击写 `app_cfg`（重启生效） |
 | terminal | `app_log` 最新 30 行，4 Hz 刷新 |
+
+### 6.1a 键盘页音量键与空闲页提示
+
+键盘页顶部（键表从 y=190 开始，正好用掉原来空着的上半部分）：
+
+| 控件 | 位置（x,y,w,h） | 行为 |
+| --- | --- | --- |
+| `VOL-` | 48, 48, 176, 100 | 按下发 Consumer 位图 bit1（Volume Decrement），抬起清零 |
+| `VOL+` | 256, 48, 176, 100 | 按下发 bit0（Volume Increment） |
+
+- 走 `app_usb_hid_consumer()`，报文是键盘接口里的 **report ID 5，1 字节位图**，USB 和蓝牙都发
+- Android 相机把它当音量键 → **拍照**；macOS 调系统音量；iOS 不认（见 `docs/gotcha.md` §5.9）
+- 两个触点可分别按住；离开键盘页自动释放
+
+空闲页（`blank`）在**有手指按下时**底部显示一行很淡的提示（`#2E2E2E`）：
+
+```
+bootkey        battery        powerkey
+   ↓            93%              ↓
+```
+
+- 由 `app_ui_set_idle_hint(visible, battery)` 控制，抬手立即隐藏
+- 电池百分比来自 BSP 的 BQ27220 电量计，约 9.6 s 刷新一次；读不到时显示 `--%`
 
 ### 6.2 手柄页侧控（坐标相对 480×480）
 

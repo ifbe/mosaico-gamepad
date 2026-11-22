@@ -24,7 +24,7 @@ static const char *TAG = "app_bt_core";
  * random address while the Classic function keeps the public BD_ADDR, so hosts
  * list them as separate devices instead of merging them. */
 #define BT_LE_NAME "Mosaico Gamepad BLE"
-#define BT_CLASSIC_NAME "Mosaico Gamepad Classic"
+#define BT_CLASSIC_NAME "Mosaico Gamepad BTClassic"
 
 static bool s_ready;
 static app_bt_mode_t s_mode = APP_BT_OFF;
@@ -228,17 +228,62 @@ static void ble_identity(void)
     }
 }
 
+/* Class of device follows what is actually enabled, because hosts use it to
+ * decide which profiles to probe:
+ *
+ * - audio on  -> Peripheral/Combo plus the audio service bits. macOS then binds
+ *   both the HID record and A2DP/HFP; without the audio bits it never even looks
+ *   at HID, and with a pure AV class it ignores HID entirely.
+ * - audio off -> Peripheral with the minor class of the enabled HID set
+ *   (keyboard / pointing / combo / gamepad). That is what makes an iPhone treat
+ *   the device as a plain Bluetooth keyboard.
+ * - nothing HID, nothing audio -> fall back to the AV/hands-free identity. */
+static esp_bt_cod_t classic_cod(void)
+{
+    const uint32_t hid = app_cfg_bt_hid();
+    const bool audio = app_cfg_bt_audio() != 0;
+    const bool kbd = (hid & APP_CLASS_KEYBOARD) != 0;
+    const bool mouse = (hid & APP_CLASS_MOUSE) != 0;
+    const bool pad = (hid & APP_CLASS_GAMEPAD) != 0;
+
+    esp_bt_cod_t cod = {0};
+    if (audio) {
+        cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING |
+                      ESP_BT_COD_SRVC_CAPTURING;
+    }
+
+    uint32_t minor = 0;
+    if (kbd && mouse) {
+        minor = ESP_BT_COD_MINOR_PERIPHERAL_COMBO;
+    } else if (kbd) {
+        minor = ESP_BT_COD_MINOR_PERIPHERAL_KEYBOARD;
+    } else if (mouse) {
+        minor = ESP_BT_COD_MINOR_PERIPHERAL_POINTING;
+    }
+    if (pad) {
+        minor |= ESP_BT_COD_MINOR_PERIPHERAL_GAMEPAD;
+    }
+
+    if (minor != 0) {
+        cod.major = ESP_BT_COD_MAJOR_DEV_PERIPHERAL;
+        cod.minor = (uint8_t)minor;
+    } else {
+        /* Nothing HID to claim; stay the audio device (or a bare hands-free). */
+        cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+        cod.minor = 0x02; /* hands-free */
+        if (!audio) {
+            cod.service = 0;
+        }
+    }
+    return cod;
+}
+
 static void classic_identity(void)
 {
     (void)esp_bt_gap_set_device_name(BT_CLASSIC_NAME);
-    /* Audio/Video major with the hands-free minor: phones only connect the
-     * hands-free profile when the class of device advertises audio. */
-    const esp_bt_cod_t cod = {
-        .minor = 0x02, /* hands-free device */
-        .major = ESP_BT_COD_MAJOR_DEV_AV,
-        .service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING |
-                   ESP_BT_COD_SRVC_CAPTURING,
-    };
+    const esp_bt_cod_t cod = classic_cod();
+    ESP_LOGI(TAG, "class of device: major=%u minor=0x%02X service=0x%03X",
+             (unsigned)cod.major, (unsigned)cod.minor, (unsigned)cod.service);
     (void)esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
     /* Discoverability is useful even before the profiles register. */
     (void)esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
@@ -295,12 +340,13 @@ const char *app_bt_core_classic_name(void)
 /* The report descriptors live in app_usb_core; the Bluetooth map is assembled
  * here from the subset selected by the persisted bt_hid mask. */
 /* The two transports have independent class masks, so each gets its own map.
- * Budget: gamepad 50 + mouse 69 + keyboard 47 + motion 58 = 224 bytes, so 256
- * leaves room for the descriptors to grow (the motion descriptor grew from 22
- * to 58 bytes when it moved to standard HID Sensors usages). */
-static uint8_t s_report_map_ble[256];
+ * Budget: gamepad 50 + mouse 69 + keyboard 83 + motion 58 = 260 bytes; 288
+ * leaves 28 bytes of headroom. The keyboard descriptor carries the consumer
+ * bitmap and the motion descriptor the three sensor collections, so both grew;
+ * anything larger silently drops a class. */
+static uint8_t s_report_map_ble[288];
 static size_t s_report_map_ble_len;
-static uint8_t s_report_map_bt[256];
+static uint8_t s_report_map_bt[288];
 static size_t s_report_map_bt_len;
 
 static size_t build_report_map(uint32_t mask, uint8_t *out, size_t cap)

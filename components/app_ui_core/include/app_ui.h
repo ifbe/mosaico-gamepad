@@ -76,6 +76,12 @@ void app_ui_set_dpad_glow(unsigned direction, bool on);
 /** Move a stick knob; coordinates are the knob's top-left corner in scene px. */
 void app_ui_set_stick_knob(bool left, int32_t x, int32_t y);
 
+/** Keyboard page volume buttons: 0 = VOL-, 1 = VOL+. Highlight while held. */
+void app_ui_set_vol_button(unsigned button, bool pressed);
+
+/** Idle page hint row: show/hide it and refresh the battery text. */
+void app_ui_set_idle_hint(bool visible, const char *battery);
+
 /** Replace one sensor page value line: 0 gyro, 1 accel, 2 magnetometer. */
 void app_ui_set_sensor_line(unsigned line, const char *text);
 

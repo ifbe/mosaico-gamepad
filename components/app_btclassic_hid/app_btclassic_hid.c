@@ -13,6 +13,15 @@ static const char *TAG = "btclassic_hid";
 
 static esp_hidd_dev_t *s_dev;
 static bool s_connected;
+/* esp_hid only clears dev->connected on ESP_HIDD_CLOSE_EVT, and that event is
+ * not always delivered: the flag then stays true and every report goes to a
+ * dead link, which Bluedroid answers with a "HID device not connected!" line per
+ * report (~62 per second). A failed send therefore mutes reports for a short
+ * while instead of forever - the next attempt inside that window is skipped, and
+ * once the link is healthy again the first retry resumes the stream. */
+#define HID_SEND_RETRY_US (1000 * 1000)
+static int64_t s_mute_until_us;
+static bool s_mute_logged;
 
 /* Apply the ACL poll interval once the link is out of sniff. The HID connect
  * event carries no peer address, so use the one app_bt_core cached from the HFP
@@ -67,6 +76,8 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_hidd_event_t)id) {
     case ESP_HIDD_CONNECT_EVENT: {
         s_connected = true;
+        s_mute_until_us = 0;
+        s_mute_logged = false;
         ESP_LOGI(TAG, "host connected");
         /* Bluedroid asks for sniff on this link after every report, so take it
          * out of sniff now and let app_bt_core's periodic kick keep it out. */
@@ -80,6 +91,8 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
+        s_mute_until_us = 0;
+        s_mute_logged = false;
         ESP_LOGI(TAG, "host disconnected");
         break;
     case ESP_HIDD_START_EVENT:
@@ -122,13 +135,33 @@ esp_err_t app_btclassic_hid_start(const uint8_t *report_map, size_t report_map_l
 
 bool app_btclassic_hid_connected(void)
 {
-    return s_dev != NULL && esp_hidd_dev_connected(s_dev);
+    if (s_dev == NULL || !esp_hidd_dev_connected(s_dev)) {
+        return false;
+    }
+    return s_mute_until_us == 0 || esp_timer_get_time() >= s_mute_until_us;
 }
 
 void app_btclassic_hid_send(uint8_t report_id, const uint8_t *data, size_t len)
 {
-    if (!app_btclassic_hid_connected()) {
+    if (s_dev == NULL || !esp_hidd_dev_connected(s_dev)) {
         return;
     }
-    (void)esp_hidd_dev_input_set(s_dev, 0, report_id, (uint8_t *)data, (uint16_t)len);
+    const int64_t now = esp_timer_get_time();
+    if (s_mute_until_us != 0 && now < s_mute_until_us) {
+        return; /* still inside the retry window */
+    }
+    const esp_err_t err = esp_hidd_dev_input_set(s_dev, 0, report_id,
+                                                 (uint8_t *)data, (uint16_t)len);
+    if (err != ESP_OK) {
+        s_mute_until_us = now + HID_SEND_RETRY_US;
+        if (!s_mute_logged) {
+            s_mute_logged = true;
+            ESP_LOGW(TAG, "send failed (%s); retrying in %d ms",
+                     esp_err_to_name(err), (int)(HID_SEND_RETRY_US / 1000));
+        }
+    } else if (s_mute_logged) {
+        s_mute_logged = false;
+        s_mute_until_us = 0;
+        ESP_LOGI(TAG, "reports flowing again");
+    }
 }

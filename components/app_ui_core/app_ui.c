@@ -95,6 +95,7 @@ struct app_ui {
     int32_t marquee_pos;   /* distance travelled along the perimeter, px */
     app_ui_layout_t layout;
     bool sensor_mouse;      /* gyro-mouse button state, sensor page only */
+    bool hint_shown;        /* idle hint row currently visible */
     esp_gsp_err_t last_error;
 };
 
@@ -279,6 +280,33 @@ void app_ui_set_stick_knob(bool left, int32_t x, int32_t y)
         x, y));
 }
 
+void app_ui_set_vol_button(unsigned button, bool pressed)
+{
+    if (button > 1 || s_app.gsp == NULL) {
+        return;
+    }
+    const gsp_component_key_t text = button == 0 ? GSP_GAMEPAD_OBJ_KEY_KBD_VOL_DOWN_TEXT
+                                                 : GSP_GAMEPAD_OBJ_KEY_KBD_VOL_UP_TEXT;
+    remember(button == 0 ? gsp_gamepad_kbd_vol_down_on_set_visible(s_app.gsp, pressed)
+                         : gsp_gamepad_kbd_vol_up_on_set_visible(s_app.gsp, pressed));
+    remember(esp_gsp_component_set_color_rgb888(s_app.gsp, text,
+                                               pressed ? 0x101010u : 0xE0E0E0u));
+}
+
+void app_ui_set_idle_hint(bool visible, const char *battery)
+{
+    if (s_app.gsp == NULL) {
+        return;
+    }
+    if (battery != NULL) {
+        remember(gsp_gamepad_idle_hint_batt_val_set_text(s_app.gsp, battery));
+    }
+    if (visible != s_app.hint_shown) {
+        s_app.hint_shown = visible;
+        remember(gsp_gamepad_layer_idle_set_visible(s_app.gsp, visible));
+    }
+}
+
 void app_ui_set_sensor_line(unsigned line, const char *text)
 {
     if (line >= SENSOR_LINES || s_app.gsp == NULL || text == NULL) {
@@ -367,6 +395,7 @@ void app_ui_set_layout(app_ui_layout_t layout)
     remember(gsp_gamepad_layer_mouse_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_MOUSE));
     remember(gsp_gamepad_layer_keyboard_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_KEYBOARD));
     remember(gsp_gamepad_layer_sensor_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_SENSOR));
+    /* layer_idle carries only the touch hint row; app_ui_set_idle_hint() owns it. */
     remember(gsp_gamepad_layer_terminal_set_visible(s_app.gsp, layout == APP_UI_LAYOUT_TERMINAL));
     /* Link state labels belong to the idle screen only. */
     remember(gsp_gamepad_layer_setting_set_visible(s_app.gsp,

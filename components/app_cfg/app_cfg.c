@@ -361,9 +361,11 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
         payload_value(payload, "value", value, sizeof(value));
         bool known = true;
         if (strcmp(key, "usb_hid") == 0 || strcmp(key, "bt_hid") == 0) {
-            uint32_t mask = (uint32_t)strtoul(value, NULL, 0) & APP_CLASS_USB_ALL;
+            const bool bt = key[0] == 'b';
+            const uint32_t limit = bt ? APP_CLASS_BT_ALL : APP_CLASS_USB_ALL;
+            uint32_t mask = (uint32_t)strtoul(value, NULL, 0) & limit;
             if (strcmp(value, "all") == 0) {
-                mask = APP_CLASS_USB_ALL;
+                mask = limit;
             } else if (strcmp(value, "none") == 0) {
                 mask = 0;
             }
@@ -375,9 +377,12 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
                 save_u32("bt_hid", mask);
             }
         } else if (strcmp(key, "ble_hid") == 0) {
-            uint32_t mask = (uint32_t)strtoul(value, NULL, 0) & APP_CLASS_ALL;
+            /* The BLE mask may carry the motion bit as well, so clamp to the
+             * same set app_cfg_set_ble_hid() accepts; clamping to APP_CLASS_ALL
+             * silently dropped sensor here while the settings page accepted it. */
+            uint32_t mask = (uint32_t)strtoul(value, NULL, 0) & APP_CLASS_BT_ALL;
             if (strcmp(value, "all") == 0) {
-                mask = APP_CLASS_ALL;
+                mask = APP_CLASS_BT_ALL;
             } else if (strcmp(value, "none") == 0) {
                 mask = 0;
             }

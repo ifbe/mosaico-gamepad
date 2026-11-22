@@ -6,6 +6,7 @@
 
 #include "app_audio_codec.h"
 #include "app_bt_core.h"
+#include "app_cfg.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -553,6 +554,15 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 esp_err_t app_btclassic_audio_start(void)
 {
     if (s_started) {
+        return ESP_OK;
+    }
+
+    /* Audio classes off: do not register A2DP/HFP at all. Hosts decide from the
+     * SDP records (and the class of device) whether this is a speaker; leaving
+     * them registered makes macOS and iOS treat the device as audio only and
+     * never bind HID. */
+    if (app_cfg_bt_audio() == 0) {
+        ESP_LOGI(TAG, "audio profiles disabled by configuration (HID only)");
         return ESP_OK;
     }
 

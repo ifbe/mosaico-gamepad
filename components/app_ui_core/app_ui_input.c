@@ -15,6 +15,7 @@
 #include "app_cfg.h"
 #include "app_ui.h"
 #include "app_sensor.h"
+#include "bsp/battery.h"
 #include "app_usb_hid.h"
 
 #include "esp_check.h"
@@ -181,6 +182,17 @@ static const struct {
     {440, 350, 40, 40, 0x4C, 0x00}, /* delete */
 };
 #define KEY_COUNT (sizeof(s_keys) / sizeof(s_keys[0]))
+
+/* Consumer Control bitmap bits (the keyboard interface carries this one-byte
+ * report): bit0 volume up, bit1 volume down. Phones map those to the camera
+ * shutter. */
+#define CONSUMER_BIT_VOL_UP 0
+#define CONSUMER_BIT_VOL_DOWN 1
+
+/* Volume buttons on the keyboard page: which contact grabbed which button, and
+ * which buttons are currently held (bit0 VOL-, bit1 VOL+). */
+static int8_t s_vol_grab[TOUCH_MAX_POINTS] = {-1, -1};
+static uint8_t s_vol_held;
 
 typedef struct {
     int32_t x;
@@ -1053,6 +1065,110 @@ static void sensor_tap(int32_t x, int32_t y)
     sensor_set_mouse(!s_sensor_mouse);
 }
 
+/* --------------------------------------------------- keyboard volume keys --- */
+
+/* Two big buttons above the key table (keys start at y=190). */
+#define VOL_BTN_Y 48
+#define VOL_BTN_W 176
+#define VOL_BTN_H 100
+#define VOL_BTN_DOWN_X 48
+#define VOL_BTN_UP_X 256
+
+
+/* Battery hint on the idle page: refresh slowly, the gauge is I2C. */
+#define BATTERY_DIV 625 /* 16 ms tick -> ~10 s */
+#define IDLE_HINT_BATTERY_MAX 8
+
+static unsigned s_battery_div;
+static char s_battery_text[IDLE_HINT_BATTERY_MAX] = "--%";
+
+static bool keyboard_class_enabled(void)
+{
+    const uint32_t masks = app_cfg_classes() | app_cfg_bt_hid() | app_cfg_ble_hid();
+    return (masks & APP_CLASS_KEYBOARD) != 0;
+}
+
+/* Which volume button a point lands on: 0 VOL-, 1 VOL+, -1 none. */
+static int vol_at(int32_t x, int32_t y)
+{
+    if (y < VOL_BTN_Y || y >= VOL_BTN_Y + VOL_BTN_H) {
+        return -1;
+    }
+    if (x >= VOL_BTN_DOWN_X && x < VOL_BTN_DOWN_X + VOL_BTN_W) {
+        return 0;
+    }
+    if (x >= VOL_BTN_UP_X && x < VOL_BTN_UP_X + VOL_BTN_W) {
+        return 1;
+    }
+    return -1;
+}
+
+static void vol_publish(void)
+{
+    uint16_t mask = 0;
+    if ((s_vol_held & 0x1u) != 0) {
+        mask |= (uint16_t)(1u << CONSUMER_BIT_VOL_DOWN);
+    }
+    if ((s_vol_held & 0x2u) != 0) {
+        mask |= (uint16_t)(1u << CONSUMER_BIT_VOL_UP);
+    }
+    app_usb_hid_consumer(mask);
+}
+
+static void vol_hold(int contact, int button, bool down)
+{
+    if (down) {
+        s_vol_grab[contact] = (int8_t)button;
+        s_vol_held |= (uint8_t)(1u << button);
+        app_ui_set_vol_button((unsigned)button, true);
+    } else {
+        const int8_t held = s_vol_grab[contact];
+        s_vol_grab[contact] = -1;
+        if (held >= 0) {
+            s_vol_held &= (uint8_t)~(1u << held);
+            app_ui_set_vol_button((unsigned)held, false);
+        }
+    }
+    vol_publish();
+}
+
+static void vol_release_all(void)
+{
+    for (int i = 0; i < TOUCH_MAX_POINTS; ++i) {
+        if (s_vol_grab[i] >= 0) {
+            vol_hold(i, s_vol_grab[i], false);
+        }
+    }
+}
+
+/* ------------------------------------------------------- idle hint row --- */
+
+static void battery_refresh(void)
+{
+    bsp_battery_status_t status;
+    static bool inited;
+    if (!inited) {
+        inited = bsp_battery_init() == ESP_OK;
+        if (!inited) {
+            return;
+        }
+    }
+    if (bsp_battery_read(&status) != ESP_OK) {
+        return;
+    }
+    snprintf(s_battery_text, sizeof(s_battery_text), "%u%%", (unsigned)status.state_of_charge);
+}
+
+static void idle_hint_update(void)
+{
+    if (++s_battery_div >= BATTERY_DIV) {
+        s_battery_div = 0;
+        battery_refresh();
+    }
+    const bool touching = s_in.points[0].active || s_in.points[1].active;
+    app_ui_set_idle_hint(touching, s_battery_text);
+}
+
 static void on_input_event(const app_input_event_t *event)
 {
     if (event->type >= APP_INPUT_KEY_DOWN) {
@@ -1066,6 +1182,12 @@ static void on_input_event(const app_input_event_t *event)
                                 .active = event->type != APP_INPUT_TOUCH_UP};
     s_overlay.changed = true;
     if (event->type == APP_INPUT_TOUCH_DOWN) {
+        if (app_ui_layout() == APP_UI_LAYOUT_KEYBOARD) {
+            const int vol = vol_at(event->x, event->y);
+            if (vol >= 0 && keyboard_class_enabled()) {
+                vol_hold(id, vol, true);
+            }
+        }
         if (app_ui_layout() == APP_UI_LAYOUT_SENSOR) {
             const int button = sensor_click_at(event->x, event->y);
             if (button >= 0) {
@@ -1078,6 +1200,9 @@ static void on_input_event(const app_input_event_t *event)
          * the contact over to the stick underneath. */
         s_in.capture[id] = side_at(event->x, event->y);
     } else if (event->type == APP_INPUT_TOUCH_UP) {
+        if (s_vol_grab[id] >= 0) {
+            vol_hold(id, s_vol_grab[id], false);
+        }
         if (app_ui_layout() == APP_UI_LAYOUT_SENSOR && s_sensor_grab[id] >= 0) {
             sensor_click_hold(id, s_sensor_grab[id], false);
         }
@@ -1111,6 +1236,9 @@ static void input_task(void *arg)
         case APP_UI_LAYOUT_SETTING:
             settings_update();
             break;
+        case APP_UI_LAYOUT_BLANK:
+            idle_hint_update();
+            break;
         default:
             break;
         }
@@ -1118,6 +1246,12 @@ static void input_task(void *arg)
         if (layout != s_last_layout) {
             if (s_last_layout == APP_UI_LAYOUT_GAMEPAD) {
                 gamepad_release_all();
+            }
+            if (s_last_layout == APP_UI_LAYOUT_KEYBOARD) {
+                vol_release_all();
+            }
+            if (s_last_layout == APP_UI_LAYOUT_BLANK) {
+                app_ui_set_idle_hint(false, NULL);
             }
             if (s_last_layout == APP_UI_LAYOUT_SENSOR) {
                 /* The switch and the mouse buttons belong to this page only. */

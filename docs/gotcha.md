@@ -406,6 +406,29 @@ bt_classic: mic rate: 100 iters/s, 16000 B/s, amp=2500
 
 ---
 
+### 5.9 iOS / 主机侧音量与快门：AVRCP 能做，HID 不能
+
+**问题**：同一个蓝牙设备能不能既是音响、又能控制音量？
+
+**能，但走的是 AVRCP（或 HFP），不是 HID。** 主机对「音响」的音量本来就有专门通道：
+
+| 通道 | 方向 | 主机支持 | 说明 |
+| --- | --- | --- | --- |
+| **AVRCP 1.4 Absolute Volume** | 音响（TG）→ 手机 | iOS ✅ / Android ✅ | 音响改自己的音量后发 `ESP_AVRC_RN_VOLUME_CHANGE`（0..127），手机媒体音量跟随；手机也会用 `SET_ABSOLUTE_VOLUME_CMD` 下发（[Sony 说明](https://support.sony.jp/electronics/support/articles/S1505017015550)） |
+| **HFP `AT+VGS` / `AT+VGM`** | HF → AG | 车机常用，iOS 支持 | 0..15 档；IDF 侧 `esp_hf_client_volume_update(ESP_HF_VOLUME_CONTROL_TARGET_SPK, v)` |
+| HID Consumer 音量键 | 外设 → 主机 | Android ✅ / macOS ✅ / **iOS ❌** | 就是本项目现在给"拍照"用的那条 |
+
+本项目现状：A2DP sink + HFP HF 都有，**没有 AVRCP TG**，所以两边音量各管各的。要落地「音响 + 音量键控手机音量」，需要加 `esp_avrc_tg_init()` / `esp_avrc_tg_register_callback()`，处理
+`ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT` 与 `ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT`（`ESP_AVRC_RN_VOLUME_CHANGE`），并把音量落到 ES8311 输出上。
+
+**相机快门在 iOS 上不要指望**：
+
+- 自拍杆/快门遥控的原理是伪装 HID 发「音量+」，[经典蓝牙 HID 键盘](https://cloud.tencent.com.cn/developer/ask/sof/102278137) 是常见形态
+- BLE HID + Consumer 音量+ 的写法在 **iOS 15 可用、iOS 16 起失效**（[Nordic 实测](https://devzone.nordicsemi.com/f/nordic-q-a/92798/trigger-ios-shutter-via-ble-on-ios-16)）
+- 我们的设备 iOS 压根不绑 HID（只认音频），所以这条在 iPhone 上目前完全不通
+
+**iOS 对 HID 的平台限制**（与描述符无关）：通用 HID 鼠标只在「辅助功能 → 触控 → 辅助触控 → 设备」里可用；通用 HID 手柄不认，只认 MFi / Xbox / DualShock / DualSense（按 VID/PID 特判）。所以哪怕 HID 打通，鼠标和手柄在 iPhone 上也不会作为可用设备出现。
+
 ## 六、显示（GSP / CO5300）
 
 ### 6.1 TE 同步与两条黑线
@@ -570,7 +593,24 @@ python3 mosaico.py iris memory $P                  # 本机型返回 not_support
 4. **麦克风双消费者**：USB 采集与 SCO 在直连模式下抢同一 I2S 流（当前 USB 未开，未暴露）
 5. **BLE 事件不派发**：`ESP_HIDD_*` 事件有时收不到，只能用轮询 `esp_hidd_dev_connected()` 兜底
 6. **显示长跑**：TE 合成路径在长时间运行后仍可能 `NO_MEM`（已用 `psram_dma_direct` 大幅缓解，未根除）
-7. **USB 运动接口在 Windows 上**：结构已合法（Report ID 在顶层集合内），但没有导出 `Unit` /
+7. **音量键（手机快门）的三次尝试**：Consumer 集合用 **Array** 形式 → macOS/Android 都不认；
+   把音量键塞进键盘页 usage 0x80/0x81（只放宽 usage max）→ 同样不认（macOS 只从 Consumer 页取媒体键）；
+   最终按 `ESP32_BLE_Keyboard` 的做法用 **位图**（Var）的 Consumer 集合 → Android 经典/BLE 正常。
+   后续为压描述符又缩成 **8 bit / 1 字节**（bit0 Vol+、bit1 Vol−、其余 Mute/Play/Next/Prev/Stop/AC Home），
+   report ID 5 的报文长度因此是 **1 字节**。结论：**媒体键用位图，不要用 usage 数组**
+8. **改了描述符必须重新配对**：经典蓝牙走 SDP、BLE 走 GATT 缓存，主机都会记住旧的一份；
+   新增 report ID 后旧缓存里没有它，报文发出去被静默丢弃（字母能打、新键没反应就是这个原因）
+9. **Class of Device 决定主机探哪些 profile**：现在 CoD 按启用掩码计算——有音频 → Peripheral/Combo +
+   Audio/Rendering/Capturing 服务位；只有 HID → Peripheral + 键盘/鼠标/Combo/手柄位；都没有 → AV/handsfree。
+   要点：原来是固定 AV + handsfree，macOS 只挂 HFP/A2DP（`Services: HFP A2DP ACL`）、HID 根本不探；
+   `bt_audio` 为空时干脆不注册 A2DP/HFP，配合 Peripheral CoD，**iPhone 才会把设备认成键盘**。
+   平台限制仍在：macOS 不绑鼠标集合，iOS 即使认了键盘也不支持通用鼠标/手柄（见
+   `docs/app_btclassic.md` §Host quirks）
+9.1. **report map 有硬上限**（`s_report_map_bt/ble` 288 B）：gamepad 50 + mouse 69 + keyboard 83 +
+   motion 58 = 260。某类放不下会打 `report map full`，而且**报文仍照发**——经典链路里失败的发送会
+   触发 `app_btclassic_hid_send()` 的「全局静音 1 秒」，把键鼠一起吞掉，表现为「开 sensor 键鼠失效」。
+   加描述符前先算这笔账
+10. **USB 运动接口在 Windows 上**：结构已合法（Report ID 在顶层集合内），但没有导出 `Unit` /
    Feature 属性（Reporting State `0x0316`、Report Interval `0x030E`），Windows 传感器类驱动可能
    拒绝绑定；Android/WebHID 侧按 report ID 4 读取，18 字节载荷
-8. **`app_usb_hid.c` 里的 `s_usb.report_map[512]`** 只写不读，属于死代码，可以删除
+11. **`app_usb_hid.c` 里的 `s_usb.report_map[512]`** 只写不读，属于死代码，可以删除

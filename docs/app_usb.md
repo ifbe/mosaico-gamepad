@@ -12,7 +12,7 @@ fills it with HID interfaces and a UAC2 audio function. This document describes
 | data link | CDC-ACM | ESP-Iris data transport | second serial port |
 | gamepad | HID (report 1) | `usb_hid` bit 0 | a generic game controller |
 | mouse | HID (report 2) | `usb_hid` bit 1 | a relative mouse |
-| keyboard | HID (report 3) | `usb_hid` bit 2 | a 6-key-rollover keyboard |
+| keyboard | HID (report 3 + consumer report 5) | `usb_hid` bit 2 | a 6-key-rollover keyboard plus a media/volume control |
 | Sony | HID (report 1, 64 B) | `usb_hid` bit 3 (DS4) or 4 (DS5) | a DualShock 4 / DualSense |
 | motion | HID (report 4) | `usb_hid` bit 5 | a HID sensor device (Motion) |
 | audio | UAC2 | `usb_audio` | speakers + microphone |
@@ -60,6 +60,25 @@ hat. The report is resent on change and at least every 250 ms.
 | 0 | modifiers (bit0 LCtrl … bit7 RGUI) |
 | 1 | reserved, 0 |
 | 2–7 | six simultaneous key codes, 0 when unused |
+
+## HID consumer control (`report ID 5`, 1 byte)
+
+Carried inside the keyboard interface (no IN endpoint left for another one): an
+8-bit bitmap of one-bit Consumer usages, the shape Android and macOS accept (an
+array of usage codes was ignored by both).
+
+| Bit | Usage | Used by |
+| --- | --- | --- |
+| 0 | Volume Increment (0xE9) | keyboard page `VOL+` |
+| 1 | Volume Decrement (0xEA) | keyboard page `VOL-` |
+| 2 | Mute (0xE2) | – |
+| 3 | Play/Pause (0xCD) | – |
+| 4/5 | Scan Next / Previous | – |
+| 6 | Stop | – |
+| 7 | AC Home | – |
+
+`app_usb_hid_consumer(mask)` publishes it; the web/phone camera shutter sees a
+volume key, so `VOL+`/`VOL-` take a photo on Android.
 
 ## HID motion
 

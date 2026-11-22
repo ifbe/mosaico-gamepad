@@ -84,13 +84,36 @@ static const uint8_t s_desc_sensor[] = {
     0xC0,                         /* End Collection (Application) */
 };
 
+/* Keyboard interface: a 6-key keyboard (report ID 3) plus a Consumer Control
+ * bitmap (report ID 5), modelled on ESP32_BLE_Keyboard because that is what the
+ * phones already accept: a bitmap (Var) of one-bit usages, not an array of usage
+ * codes - the array form was ignored by both macOS and Android. Bit0 is Volume
+ * Increment (0xE9) and bit1 Volume Decrement (0xEA); eight bits keep the report
+ * at one byte, which matters because this descriptor shares the Bluetooth report
+ * map with the 58-byte motion report. */
 static const uint8_t s_desc_kbd[] = {
     0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x03, 0x05, 0x07, 0x19, 0xE0,
     0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
     0x95, 0x01, 0x75, 0x08, 0x81, 0x03, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
     0x15, 0x00, 0x25, 0x65, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xC0,
+    /* Consumer Control: 8 one-bit usages, one byte on the wire. Only the first
+     * two are used by the UI (volume up/down); the rest are the usual media
+     * keys so the interface still looks like a media keyboard. Kept short on
+     * purpose: every byte here competes with the motion report inside the
+     * 288-byte Bluetooth report map. */
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x05,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08,
+    0x09, 0xE9,             /* bit0 Volume Increment */
+    0x09, 0xEA,             /* bit1 Volume Decrement */
+    0x09, 0xE2,             /* bit2 Mute */
+    0x09, 0xCD,             /* bit3 Play/Pause */
+    0x09, 0xB5,             /* bit4 Scan Next Track */
+    0x09, 0xB6,             /* bit5 Scan Previous Track */
+    0x09, 0xB7,             /* bit6 Stop */
+    0x0A, 0x23, 0x02,       /* bit7 AC Home */
+    0x81, 0x02,             /* Input (Data,Var,Abs) */
+    0xC0,
 };
-
 
 /* Sony-compatible gamepad: one 64-byte input report (report ID 1 + 63 bytes).
  * The first 4 bytes are the sticks, then 14 button bits, then vendor padding to
@@ -173,6 +196,10 @@ static void sony_report(uint8_t *out, uint16_t buttons, const uint8_t sticks[4])
 #define HID_REPORT_GAMEPAD 1
 #define HID_REPORT_MOUSE 2
 #define HID_REPORT_KEYBOARD 3
+#define HID_REPORT_CONSUMER 5
+/* Bit positions inside the consumer bitmap. */
+#define CONSUMER_BIT_VOL_UP 0
+#define CONSUMER_BIT_VOL_DOWN 1
 #define HID_REPORT_SENSOR 4
 #define SENSOR_REPORT_LEN 18
 
@@ -205,6 +232,7 @@ static atomic_int s_stick_lx = 128, s_stick_ly = 128;
 static atomic_int s_stick_rx = 128, s_stick_ry = 128;
 static atomic_int s_trigger_l, s_trigger_r;
 static atomic_int s_mouse_buttons;
+static atomic_int s_consumer;   /* consumer bitmap, 0 = nothing pressed */
 static atomic_int s_mouse_dx;
 static atomic_int s_mouse_dy;
 static atomic_int s_mouse_wheel;
@@ -352,6 +380,11 @@ void app_usb_hid_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel, int8
     atomic_store(&s_mouse_buttons, buttons);
 }
 
+void app_usb_hid_consumer(uint16_t mask)
+{
+    atomic_store(&s_consumer, (int)(mask & 0xFF));
+}
+
 void app_usb_hid_keyboard(uint8_t modifiers, const uint8_t keys[KEYBOARD_KEYS])
 {
     atomic_store(&s_kbd_mods, modifiers);
@@ -399,6 +432,8 @@ static void hid_task(void *arg)
     uint8_t bt_last_gp[GAMEPAD_REPORT_LEN] = {0};
     uint8_t usb_last_kbd[KEYBOARD_REPORT_LEN] = {0};
     uint8_t bt_last_kbd[KEYBOARD_REPORT_LEN] = {0};
+    uint16_t usb_consumer = 0;
+    uint16_t bt_consumer = 0;
     int usb_sent_x = 0, usb_sent_y = 0, usb_sent_w = 0, usb_sent_p = 0;
     int bt_sent_x = 0, bt_sent_y = 0, bt_sent_w = 0, bt_sent_p = 0;
     uint8_t usb_buttons = 0, bt_buttons = 0;
@@ -451,6 +486,7 @@ static void hid_task(void *arg)
         const int total_w = atomic_load(&s_mouse_wheel);
         const int total_p = atomic_load(&s_mouse_pan);
         const uint8_t mouse_buttons_now = (uint8_t)atomic_load(&s_mouse_buttons);
+        const uint16_t consumer = (uint16_t)atomic_load(&s_consumer);
         ++mouse_tick;
 
         /* Report-side edge log: proves what actually leaves the device, which
@@ -472,6 +508,12 @@ static void hid_task(void *arg)
                 instance_for(APP_CLASS_KEYBOARD, &inst) && tud_hid_n_ready(inst)) {
                 (void)tud_hid_n_report(inst, HID_REPORT_KEYBOARD, keyboard, sizeof(keyboard));
                 memcpy(usb_last_kbd, keyboard, sizeof(keyboard));
+            }
+            if (consumer != usb_consumer &&
+                instance_for(APP_CLASS_KEYBOARD, &inst) && tud_hid_n_ready(inst)) {
+                const uint8_t payload = (uint8_t)consumer;
+                (void)tud_hid_n_report(inst, HID_REPORT_CONSUMER, &payload, sizeof(payload));
+                usb_consumer = consumer;
             }
             if (instance_for(APP_CLASS_MOUSE, &inst) && tud_hid_n_ready(inst)) {
                 const int rx = clamp_delta(total_x - usb_sent_x);
@@ -500,6 +542,11 @@ static void hid_task(void *arg)
             if (memcmp(keyboard, bt_last_kbd, sizeof(keyboard)) != 0) {
                 bt_send(HID_REPORT_KEYBOARD, keyboard, sizeof(keyboard));
                 memcpy(bt_last_kbd, keyboard, sizeof(keyboard));
+            }
+            if (consumer != bt_consumer) {
+                const uint8_t payload = (uint8_t)consumer;
+                bt_send(HID_REPORT_CONSUMER, &payload, sizeof(payload));
+                bt_consumer = consumer;
             }
             /* Classic HID cannot drain 125 Hz; ~62 Hz keeps the queue short. */
             if (mouse_tick % MOUSE_EVERY_TICKS == 0) {

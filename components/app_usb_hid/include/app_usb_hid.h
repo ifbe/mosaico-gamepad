@@ -62,6 +62,11 @@ void app_usb_hid_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel, int8
 /** Keyboard report: modifier bits plus up to six HID key codes (0 = empty). */
 void app_usb_hid_keyboard(uint8_t modifiers, const uint8_t keys[APP_HID_KEYBOARD_KEYS]);
 
+/** Consumer Control bitmap (0 = release). Bit 5 is Volume Increment, bit 6
+ * Volume Decrement; it rides the keyboard interface. Phones map those to the
+ * camera shutter. */
+void app_usb_hid_consumer(uint16_t mask);
+
 #ifdef __cplusplus
 }
 #endif

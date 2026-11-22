@@ -81,6 +81,64 @@ Inside, the kick calls `bta_dm_pm_active()` — an exported BTA symbol with no
 public header (declared in `app_bt_core.c`). Call sites: HID connect, HFP
 stack-up and every call/ring event, plus the periodic timer.
 
+## Host quirks
+
+### Class of device follows the enabled classes
+
+Hosts pick profiles from the class of device, so it is computed at boot from the
+masks (`classic_cod()` in `app_bt_core.c`):
+
+| Enabled | Major / minor | Service bits |
+| --- | --- | --- |
+| audio + HID | Peripheral / Combo (0x30), plus the gamepad bit when the pad is on | Audio, Rendering, Capturing |
+| HID only, keyboard | Peripheral / Keyboard (0x10) | none |
+| HID only, mouse | Peripheral / Pointing (0x20) | none |
+| HID only, keyboard + mouse | Peripheral / Combo (0x30) | none |
+| no HID, no audio | Audio/Video, hands-free | none |
+
+The boot log prints the result, e.g. `class of device: major=5 minor=0x32 service=0x160`.
+
+Why it matters: with the old fixed Audio/Video + hands-free class, macOS listed
+the device as `Minor Type: Handsfree` with only `HFP A2DP ACL` services and never
+looked at the HID record, while Windows and Android probe every SDP record and
+worked. Claiming a peripheral makes macOS bind HID.
+
+**HID-only mode.** `app_btclassic_audio_start()` returns immediately when the
+`bt_audio` mask is empty: A2DP and HFP are then not registered at all, so the
+device advertises nothing but HID and a host sees a plain Bluetooth keyboard
+(and, in practice, an iPhone bound it as one once CoD said keyboard). Enabling
+the audio classes again needs a reboot and a re-pair.
+
+### What each host actually does
+
+| Host | Classic | BLE |
+| --- | --- | --- |
+| Windows | full HID (pad/mouse/keyboard) + audio | full HID |
+| Android | full HID + audio; consumer volume keys reach the camera shutter | full HID |
+| macOS | audio + keyboard (the mouse collection is ignored, even with the combo minor class) | keyboard via HOGP expected |
+| iOS | audio only | audio only, unless the device is HID-only (see above) |
+
+iOS does not accept this device as HID while it also offers A2DP/HFP: the phone
+pairs for audio and never subscribes to the HID service. With the audio classes
+disabled the iPhone does bind the keyboard. iOS also only supports generic HID
+mice through AssistiveTouch and generic HID gamepads through MFi or the Xbox/PS
+profiles, so even then mouse and pad are not usable there.
+
+### Report map budget
+
+The map has a hard size (`s_report_map_bt/ble`, 288 bytes) because it is built
+into a fixed buffer and embedded in the SDP record. Current sizes: gamepad 50 +
+mouse 69 + keyboard 83 + motion 58 = 260. A class that does not fit is dropped
+with `report map full: ...`, and the reports for it then fail on every send.
+
+### Report map / class changes need a re-pair
+
+Hosts cache the SDP record (Classic) and the GATT database (BLE) per bonded
+device. After changing any report descriptor, class of device or advertisement,
+the host still uses the old copy: reports for a new report ID silently go
+nowhere. Forget the device on the host, clear the bonds here (RPC method 7) and
+pair again.
+
 ## Diagnostics
 
 One `bt_classic: status` line every 10 s summarises every link and counter
