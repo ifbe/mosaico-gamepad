@@ -58,6 +58,10 @@ bool app_bt_core_classic_peer(uint8_t out[6]);
 /** Kick counters since boot, for the status line. Any pointer may be NULL. */
 void app_bt_core_kick_stats(unsigned *kicks, unsigned *throttled, unsigned *age_ms);
 
+/** Turn BLE advertising on or off. Starting is deferred until the advertisement
+ * payload and the GATT service named in it are both ready. */
+void app_bt_core_ble_advertise(bool on);
+
 /** LE advertising name (also the classic device name's counterpart). */
 const char *app_bt_core_le_name(void);
 

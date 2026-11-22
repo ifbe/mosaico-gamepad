@@ -42,6 +42,7 @@ The ESP-IDF checkout must stay unmodified (`git -C "$IDF_PATH" status` empty).
 | --- | --- |
 | [docs/app_ui.md](docs/app_ui.md) | The whole UI: `app_ui_display` / `app_ui_touch` / `app_ui_core` contracts, input event model, startup order, page and settings semantics, gamepad layout, acceptance list |
 | [docs/gotcha.md](docs/gotcha.md) | Subsystem notes and triage: USB endpoints, HID descriptors, Classic/BLE HID, call audio, display, memory |
+| [docs/todo.md](docs/todo.md) | Open work and candidate features: LE Audio, dual role, two-device intercom |
 | [docs/app_cfg.md](docs/app_cfg.md) | Class masks, NVS persistence, configuration RPC |
 | [docs/app_usb.md](docs/app_usb.md) | USB interfaces: gamepad, mouse, keyboard, Sony and motion reports, UAC2 audio |
 | [docs/app_btclassic.md](docs/app_btclassic.md) | Classic Bluetooth interfaces: HID device, A2DP sink, HFP hands-free |

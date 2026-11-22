@@ -39,6 +39,7 @@ static uint16_t s_usb_pid;
 /* Registered by app_ui_core at startup: the UI owns the pages, this component
  * only relays the RPC. Never NULL once the UI started. */
 static const app_cfg_layout_rpc_t *s_layout_rpc;
+static app_cfg_ble_adv_fn_t s_ble_adv_rpc;
 
 static const struct {
     const char *name;
@@ -452,7 +453,9 @@ static esp_err_t rpc_handler(const esp_iris_rpc_request_t *request, uint8_t *res
         break;
     }
     case 8: { /* restart BLE advertising: {"cmd":"ble_adv"} */
-        app_ble_hid_restart_advertising();
+        if (s_ble_adv_rpc != NULL) {
+            s_ble_adv_rpc();
+        }
         written = snprintf((char *)response, response_capacity, "{\"advertising\":true}");
         break;
     }
@@ -526,6 +529,11 @@ static void rpc_task(void *arg)
         ESP_LOGI(TAG, "rpc %u: %s", (unsigned)method, esp_err_to_name(err));
     }
     vTaskDelete(NULL);
+}
+
+void app_cfg_set_ble_adv_rpc(app_cfg_ble_adv_fn_t fn)
+{
+    s_ble_adv_rpc = fn;
 }
 
 void app_cfg_set_layout_rpc(const app_cfg_layout_rpc_t *rpc)

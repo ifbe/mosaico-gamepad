@@ -11,92 +11,20 @@
 #include "esp_gap_ble_api.h"
 #include "esp_hidd_gatts.h"
 #include "esp_timer.h"
-#include "esp_mac.h"
 #include "esp_hidd.h"
 #include "esp_log.h"
 
 static const char *TAG = "app_ble_hid";
 
-#define BLE_APPEARANCE_GAMEPAD 0x03C4 /* HID Gamepad */
-
+/* Advertising is not a HID concern: the payload, its timing and the policy live
+ * in app_bt_core (see app_bt_core_ble_advertise). This component only owns the
+ * HOGP service, the pairing parameters and report delivery, and reports when the
+ * GATT database is up so core knows it may advertise. */
 static esp_hidd_dev_t *s_dev;
 static bool s_connected;
 static unsigned s_send_ok;
-static bool s_adv_ready;
-static bool s_rsp_ready;
 static unsigned s_send_fail;
-
-static void advertising_params(esp_ble_adv_params_t *params)
-{
-    *params = (esp_ble_adv_params_t){
-        .adv_int_min = 0x20,
-        .adv_int_max = 0x30,
-        .adv_type = ADV_TYPE_IND,
-        .own_addr_type = BLE_ADDR_TYPE_RANDOM,
-        .channel_map = ADV_CHNL_ALL,
-        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-    };
-}
-
-static esp_err_t advertising_start(void)
-{
-    esp_ble_adv_params_t params;
-    advertising_params(&params);
-    return esp_ble_gap_start_advertising(&params);
-}
-
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
-{
-    switch (event) {
-    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT: {
-        const esp_err_t err = advertising_start();
-        ESP_LOGI(TAG, "start advertising: %s", esp_err_to_name(err));
-        break;
-    }
-    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        ESP_LOGI(TAG, "advertising %s",
-                 param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS ? "on" : "failed");
-        break;
-    case ESP_GAP_BLE_SEC_REQ_EVT:
-        (void)esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
-        break;
-    case ESP_GAP_BLE_NC_REQ_EVT:
-        /* Numeric comparison: only reachable if MITM were enabled. */
-        ESP_LOGI(TAG, "numeric comparison %06" PRIu32, param->ble_security.key_notif.passkey);
-        (void)esp_ble_confirm_reply(param->ble_security.key_notif.bd_addr, true);
-        break;
-    case ESP_GAP_BLE_PASSKEY_REQ_EVT:
-        (void)esp_ble_passkey_reply(param->ble_security.ble_req.bd_addr, false, 0);
-        break;
-    case ESP_GAP_BLE_AUTH_CMPL_EVT:
-        ESP_LOGI(TAG, "auth %s", param->ble_security.auth_cmpl.success ? "ok" : "failed");
-        if (!param->ble_security.auth_cmpl.success) {
-            ESP_LOGE(TAG, "auth fail reason 0x%x; removing stale bond",
-                     param->ble_security.auth_cmpl.fail_reason);
-            /* Keys that no longer match (security params changed, phone kept an
-             * old record) otherwise make every retry fail with "PIN wrong". */
-            (void)esp_ble_remove_bond_device(param->ble_security.auth_cmpl.bd_addr);
-        }
-        break;
-    case ESP_GAP_BLE_KEY_EVT:
-        ESP_LOGI(TAG, "key type %d", param->ble_security.ble_key.key_type);
-        break;
-    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-        ESP_LOGI(TAG, "conn params: status=%d interval=%d latency=%d timeout=%d",
-                 (int)param->update_conn_params.status,
-                 (int)param->update_conn_params.conn_int,
-                 (int)param->update_conn_params.latency,
-                 (int)param->update_conn_params.timeout);
-        break;
-    case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
-        ESP_LOGI(TAG, "passkey %06" PRIu32, param->ble_security.key_notif.passkey);
-        break;
-    default:
-        ESP_LOGI(TAG, "gap event %d", (int)event);
-        break;
-    }
-}
+static bool s_service_ready;
 
 static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_t id,
                                void *event_data)
@@ -111,13 +39,13 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
-        ESP_LOGI(TAG, "host disconnected; advertising again");
-        /* Bluedroid stops advertising on connect; without this a host that
-         * disconnects (or fails to pair) never sees the device again. */
-        (void)advertising_start();
+        ESP_LOGI(TAG, "host disconnected");
         break;
     case ESP_HIDD_START_EVENT:
-        ESP_LOGI(TAG, "HID device started");
+        /* Emitted when the GATT service starts: the HID database exists now and
+         * core can advertise without a host finding an empty service. */
+        s_service_ready = true;
+        ESP_LOGI(TAG, "GATT service ready");
         break;
     default:
         ESP_LOGI(TAG, "hidd event %d", (int)id);
@@ -130,21 +58,11 @@ static void hidd_event_handler(void *handler_args, esp_event_base_t base, int32_
 static void ble_status_task(void *arg)
 {
     (void)arg;
-    bool was_connected = false;
     unsigned tick = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         const bool connected = app_ble_hid_connected();
         s_connected = connected;
-        /* The HIDD disconnect event is not always delivered, so the link state
-         * is polled here. Only a real connected -> disconnected transition
-         * restarts advertising; restarting while a host is connecting aborts
-         * the attempt. */
-        if (was_connected && !connected) {
-            ESP_LOGI(TAG, "link dropped; advertising again");
-            (void)advertising_start();
-        }
-        was_connected = connected;
         if (++tick % 10 == 0) {
             ESP_LOGI(TAG, "state: connected=%d ok=%u fail=%u", (int)connected,
                      s_send_ok, s_send_fail);
@@ -157,59 +75,8 @@ esp_err_t app_ble_hid_start(const uint8_t *report_map, size_t report_map_len)
     if (report_map == NULL || report_map_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_RETURN_ON_ERROR(esp_ble_gap_register_callback(gap_event_handler), TAG, "gap cb");
+    s_service_ready = false;
 
-    /* Static random address: gives the LE identity its own BD_ADDR, separate
-     * from the Classic public address. Sharing one address makes hosts merge
-     * both records, and the visible name alternates between the two. The
-     * address is derived from the base MAC, so it is stable across boots. */
-    uint8_t random_addr[6];
-    ESP_RETURN_ON_ERROR(esp_read_mac(random_addr, ESP_MAC_BT), TAG, "bt mac");
-    random_addr[0] ^= 0xA5;
-    /* Static random address: the two most significant bits must be 11.
-     * Bluedroid validates byte 0 while the LE spec talks about the most
-     * significant byte, so set the type bits on both ends. */
-    random_addr[0] = (uint8_t)((random_addr[0] & 0x3F) | 0xC0);
-    random_addr[5] = (uint8_t)((random_addr[5] & 0x3F) | 0xC0);
-    ESP_LOGI(TAG, "LE address %02X:%02X:%02X:%02X:%02X:%02X", random_addr[5],
-             random_addr[4], random_addr[3], random_addr[2], random_addr[1],
-             random_addr[0]);
-    const esp_err_t rand_err = esp_ble_gap_set_rand_addr(random_addr);
-    if (rand_err != ESP_OK) {
-        ESP_LOGE(TAG, "random address rejected: %s", esp_err_to_name(rand_err));
-    }
-
-    /* Hand-built advertisement: flags + 16-bit HID service UUID + name fits the
-     * 31-byte legacy payload exactly (3 + 4 + 22 = 29). The Bluedroid
-     * esp_ble_adv_data_t path only accepts 128-bit UUIDs, which would not fit. */
-    const char *name = app_bt_core_le_name();
-    const size_t name_len = strlen(name);
-    uint8_t adv_raw[31];
-    size_t o = 0;
-    /* Flags: LE general discoverable + BR/EDR not supported. The advertisement
-     * runs on the LE-only static random address, so claiming BR/EDR support
-     * makes Android treat it as a dual-mode device and connect over Classic
-     * instead of GATT (the "connect LE, land on Classic" symptom). */
-    adv_raw[o++] = 0x02;
-    adv_raw[o++] = 0x01;
-    adv_raw[o++] = 0x06; /* LE General Discoverable | BR/EDR Not Supported */
-    /* 16-bit service UUID list: HID over GATT (0x1812). */
-    adv_raw[o++] = 0x03;
-    adv_raw[o++] = 0x03;
-    adv_raw[o++] = 0x12;
-    adv_raw[o++] = 0x18;
-    /* Complete local name (truncated if it would overflow the payload). */
-    const size_t room = sizeof(adv_raw) - (o + 2);
-    const size_t copy = name_len < room ? name_len : room;
-    adv_raw[o++] = (uint8_t)(copy + 1);
-    adv_raw[o++] = 0x09;
-    memcpy(&adv_raw[o], name, copy);
-    o += copy;
-    esp_err_t adv_err = esp_ble_gap_config_adv_data_raw(adv_raw, (uint32_t)o);
-    if (adv_err != ESP_OK) {
-        ESP_LOGE(TAG, "raw adv rejected: %s", esp_err_to_name(adv_err));
-        return adv_err;
-    }
     /* Secure Connections + bonding, Just Works: no MITM bit, so neither side
      * asks for a passkey. The official esp_hid_device example uses
      * SC_MITM_BOND with IO_CAP_IO, which requires numeric comparison support on
@@ -254,10 +121,54 @@ esp_err_t app_ble_hid_start(const uint8_t *report_map, size_t report_map_len)
     return ESP_OK;
 }
 
-void app_ble_hid_restart_advertising(void)
+bool app_ble_hid_service_ready(void)
 {
-    const esp_err_t err = advertising_start();
-    ESP_LOGI(TAG, "restart advertising: %s", esp_err_to_name(err));
+    return s_service_ready;
+}
+
+void app_ble_hid_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    /* Core owns the GAP callback because advertising is transport-level; the
+     * pairing and connection-parameter events below are still ours. */
+    switch (event) {
+    case ESP_GAP_BLE_SEC_REQ_EVT:
+        (void)esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+        break;
+    case ESP_GAP_BLE_NC_REQ_EVT:
+        /* Numeric comparison: only reachable if MITM were enabled. */
+        ESP_LOGI(TAG, "numeric comparison %06" PRIu32, param->ble_security.key_notif.passkey);
+        (void)esp_ble_confirm_reply(param->ble_security.key_notif.bd_addr, true);
+        break;
+    case ESP_GAP_BLE_PASSKEY_REQ_EVT:
+        (void)esp_ble_passkey_reply(param->ble_security.ble_req.bd_addr, false, 0);
+        break;
+    case ESP_GAP_BLE_AUTH_CMPL_EVT:
+        ESP_LOGI(TAG, "auth %s", param->ble_security.auth_cmpl.success ? "ok" : "failed");
+        if (!param->ble_security.auth_cmpl.success) {
+            ESP_LOGE(TAG, "auth fail reason 0x%x; removing stale bond",
+                     param->ble_security.auth_cmpl.fail_reason);
+            /* Keys that no longer match (security params changed, phone kept an
+             * old record) otherwise make every retry fail with "PIN wrong". */
+            (void)esp_ble_remove_bond_device(param->ble_security.auth_cmpl.bd_addr);
+        }
+        break;
+    case ESP_GAP_BLE_KEY_EVT:
+        ESP_LOGI(TAG, "key type %d", param->ble_security.ble_key.key_type);
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        ESP_LOGI(TAG, "conn params: status=%d interval=%d latency=%d timeout=%d",
+                 (int)param->update_conn_params.status,
+                 (int)param->update_conn_params.conn_int,
+                 (int)param->update_conn_params.latency,
+                 (int)param->update_conn_params.timeout);
+        break;
+    case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
+        ESP_LOGI(TAG, "passkey %06" PRIu32, param->ble_security.key_notif.passkey);
+        break;
+    default:
+        ESP_LOGI(TAG, "gap event %d", (int)event);
+        break;
+    }
 }
 
 unsigned app_ble_hid_clear_bonds(void)

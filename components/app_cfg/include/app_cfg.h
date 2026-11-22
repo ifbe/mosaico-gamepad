@@ -128,6 +128,13 @@ typedef struct {
 /** Register (or clear with NULL) the layout hooks. Call once at UI startup. */
 void app_cfg_set_layout_rpc(const app_cfg_layout_rpc_t *rpc);
 
+/** BLE advertising restart hook (RPC method 8, "ble_adv").
+ *
+ * Advertising belongs to the LE transport owner (app_bt_core); app_cfg must not
+ * depend on it, so the owner registers a callback here at startup. */
+typedef void (*app_cfg_ble_adv_fn_t)(void);
+void app_cfg_set_ble_adv_rpc(app_cfg_ble_adv_fn_t fn);
+
 #ifdef __cplusplus
 }
 #endif

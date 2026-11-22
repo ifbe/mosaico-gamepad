@@ -221,8 +221,29 @@ static esp_err_t controller_start(app_bt_mode_t mode)
     return esp_bluedroid_enable();
 }
 
+/* Static random address: the LE identity gets its own BD_ADDR, separate from the
+ * Classic public address. Sharing one address makes hosts merge both records and
+ * the visible name alternates between the two. Derived from the base MAC, so it
+ * is stable across boots. */
+static esp_err_t ble_set_random_address(void)
+{
+    uint8_t random_addr[6];
+    ESP_RETURN_ON_ERROR(esp_read_mac(random_addr, ESP_MAC_BT), TAG, "bt mac");
+    random_addr[0] ^= 0xA5;
+    /* The two most significant bits must be 11 for a static random address.
+     * Bluedroid validates byte 0 while the LE spec talks about the most
+     * significant byte, so set the type bits on both ends. */
+    random_addr[0] = (uint8_t)((random_addr[0] & 0x3F) | 0xC0);
+    random_addr[5] = (uint8_t)((random_addr[5] & 0x3F) | 0xC0);
+    ESP_LOGI(TAG, "LE address %02X:%02X:%02X:%02X:%02X:%02X", random_addr[5],
+             random_addr[4], random_addr[3], random_addr[2], random_addr[1],
+             random_addr[0]);
+    return esp_ble_gap_set_rand_addr(random_addr);
+}
+
 static void ble_identity(void)
 {
+    (void)ble_set_random_address();
     if (esp_ble_gap_set_device_name(BT_LE_NAME) != ESP_OK) {
         ESP_LOGW(TAG, "LE device name rejected");
     }
@@ -289,6 +310,226 @@ static void classic_identity(void)
     (void)esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 }
 
+/* ---------------------------------------------------------- BLE advertising --- */
+
+/* Advertising belongs to the LE transport, not to any one GATT service: the
+ * payload, the parameters and the decision to advertise all live here, next to
+ * the Classic scan mode. Services (HID today, LE Audio later) only report when
+ * their GATT database is up. */
+#define BLE_ADV_POLL_US (50 * 1000)
+/* How often the "still waiting for the service" line is repeated (poll ticks). */
+#define BLE_ADV_POLL_LOG_EVERY 20
+#define BLE_ADV_LINK_WATCH_US (1000 * 1000)
+
+static bool s_adv_wanted;
+static bool s_adv_data_ready;
+static bool s_advertising;
+static void adv_policy_enable(void);
+static unsigned s_adv_polls;
+static esp_timer_handle_t s_adv_timer;
+static esp_timer_handle_t s_adv_watch;
+static bool s_ble_link_was_up;
+
+/* Hand-built advertisement: flags + service UUID + name must fit the 31-byte
+ * legacy payload. The Bluedroid esp_ble_adv_data_t path only accepts 128-bit
+ * UUIDs, which would not fit. */
+static esp_err_t ble_adv_configure(void)
+{
+    const char *name = app_bt_core_le_name();
+    const size_t name_len = strlen(name);
+    uint8_t adv_raw[31];
+    size_t o = 0;
+    /* Flags: LE general discoverable + BR/EDR not supported. The advertisement
+     * runs on the LE-only static random address, so claiming BR/EDR support
+     * makes Android treat it as a dual-mode device and connect over Classic
+     * instead of GATT (the "connect LE, land on Classic" symptom). */
+    adv_raw[o++] = 0x02;
+    adv_raw[o++] = 0x01;
+    adv_raw[o++] = 0x06; /* LE General Discoverable | BR/EDR Not Supported */
+    /* 16-bit service UUID list: HID over GATT (0x1812). */
+    adv_raw[o++] = 0x03;
+    adv_raw[o++] = 0x03;
+    adv_raw[o++] = 0x12;
+    adv_raw[o++] = 0x18;
+    /* Complete local name (truncated if it would overflow the payload). */
+    const size_t room = sizeof(adv_raw) - (o + 2);
+    const size_t copy = name_len < room ? name_len : room;
+    adv_raw[o++] = (uint8_t)(copy + 1);
+    adv_raw[o++] = 0x09;
+    memcpy(&adv_raw[o], name, copy);
+    o += copy;
+
+    s_adv_data_ready = false;
+    const esp_err_t err = esp_ble_gap_config_adv_data_raw(adv_raw, (uint32_t)o);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "raw advertisement rejected: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void ble_adv_start(void)
+{
+    esp_ble_adv_params_t params = {
+        .adv_int_min = 0x20,
+        .adv_int_max = 0x30,
+        .adv_type = ADV_TYPE_IND,
+        .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+        .channel_map = ADV_CHNL_ALL,
+        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+    const esp_err_t err = esp_ble_gap_start_advertising(&params);
+    ESP_LOGI(TAG, "start advertising: %s", esp_err_to_name(err));
+}
+
+/* Start only when the policy asked for it, the payload is accepted and the
+ * service that the payload names already exists. */
+static void ble_adv_apply(void)
+{
+    if (!s_adv_wanted) {
+        return;
+    }
+    if (!s_adv_data_ready) {
+        ESP_LOGI(TAG, "advertising deferred (payload not ready)");
+        return;
+    }
+    if (!app_ble_hid_service_ready()) {
+        ESP_LOGI(TAG, "advertising deferred (service not ready)");
+        return;
+    }
+    ble_adv_start();
+}
+
+/* RPC method 8 asks for advertising again; the hook keeps app_cfg free of a
+ * dependency on this component. */
+static void adv_restart_hook(void)
+{
+    app_bt_core_ble_advertise(true);
+}
+
+void app_bt_core_ble_advertise(bool on)
+{
+    if (!app_bt_core_wants_ble()) {
+        return;
+    }
+    s_adv_wanted = on;
+    if (on) {
+        if (!app_ble_hid_service_ready() && s_adv_timer == NULL) {
+            /* Asked before the service was up: wait for it instead of dropping
+             * the request. */
+            adv_policy_enable();
+        }
+        ble_adv_apply();
+        return;
+    }
+    s_advertising = false;
+    const esp_err_t err = esp_ble_gap_stop_advertising();
+    ESP_LOGI(TAG, "stop advertising: %s", esp_err_to_name(err));
+}
+
+/* Bluedroid stops advertising when a host connects; once the link drops the
+ * device has to become discoverable again by itself. */
+static void adv_link_watch_cb(void *arg)
+{
+    (void)arg;
+    const bool up = app_ble_hid_connected();
+    if (up) {
+        /* A connected host means the controller stopped advertising. */
+        s_advertising = false;
+    } else if (s_ble_link_was_up) {
+        ESP_LOGI(TAG, "BLE link dropped; advertising again");
+    }
+    /* Self-healing: whenever the payload and the service are ready, the policy
+     * wants advertising and no host is connected, make sure it is on. There is
+     * no timeout on the service check - a late service is picked up on the next
+     * tick instead of being given up on. */
+    if (!up && s_adv_wanted && s_adv_data_ready && app_ble_hid_service_ready() &&
+        !s_advertising) {
+        ble_adv_apply();
+    }
+    s_ble_link_was_up = up;
+}
+
+static void adv_policy_cb(void *arg)
+{
+    (void)arg;
+    if (!app_ble_hid_service_ready()) {
+        /* Keep waiting: the service comes up asynchronously and a late one is
+         * just as good. Repeat the notice once a second instead of flooding. */
+        if (++s_adv_polls % BLE_ADV_POLL_LOG_EVERY == 1) {
+            ESP_LOGW(TAG, "waiting for the BLE service (%u ms)",
+                     (unsigned)(s_adv_polls * (BLE_ADV_POLL_US / 1000)));
+        }
+        return;
+    }
+    s_adv_wanted = true;
+    /* Configure once the service exists; the payload-set-complete event starts
+     * advertising. A failed configuration is retried on the next tick. */
+    if (ble_adv_configure() != ESP_OK) {
+        s_adv_wanted = false;
+        return;
+    }
+    (void)esp_timer_stop(s_adv_timer);
+    (void)esp_timer_delete(s_adv_timer);
+    s_adv_timer = NULL;
+}
+
+static void adv_policy_enable(void)
+{
+    if (!app_bt_core_wants_ble() || app_cfg_ble_hid() == 0) {
+        return;
+    }
+    if (s_adv_timer != NULL) {
+        return;
+    }
+    s_adv_polls = 0;
+    const esp_timer_create_args_t args = {
+        .callback = adv_policy_cb,
+        .name = "ble_adv_policy",
+    };
+    if (esp_timer_create(&args, &s_adv_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "advertising policy timer unavailable");
+        return;
+    }
+    if (esp_timer_start_periodic(s_adv_timer, BLE_ADV_POLL_US) != ESP_OK) {
+        (void)esp_timer_delete(s_adv_timer);
+        s_adv_timer = NULL;
+        return;
+    }
+
+    const esp_timer_create_args_t watch_args = {
+        .callback = adv_link_watch_cb,
+        .name = "ble_adv_watch",
+    };
+    if (esp_timer_create(&watch_args, &s_adv_watch) == ESP_OK) {
+        (void)esp_timer_start_periodic(s_adv_watch, BLE_ADV_LINK_WATCH_US);
+    }
+}
+
+/* Single GAP callback for the LE transport: advertising events are handled here,
+ * everything else (pairing, connection parameters) is forwarded to the HID
+ * service that still owns those semantics. */
+static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        s_adv_data_ready = true;
+        ble_adv_apply();
+        break;
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        s_advertising = param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS;
+        ESP_LOGI(TAG, "advertising %s", s_advertising ? "on" : "failed");
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        s_advertising = false;
+        ESP_LOGI(TAG, "advertising stopped");
+        break;
+    default:
+        app_ble_hid_gap_event(event, param);
+        break;
+    }
+}
+
 esp_err_t app_bt_core_start(void)
 {
     s_mode = app_cfg_bt_mode();
@@ -299,12 +540,16 @@ esp_err_t app_bt_core_start(void)
 
     ESP_RETURN_ON_ERROR(controller_start(s_mode), TAG, "stack");
     if (s_mode == APP_BT_BLE || s_mode == APP_BT_BOTH) {
+        /* The GAP callback first: identity setup and the advertisement both
+         * report through it. */
+        ESP_RETURN_ON_ERROR(esp_ble_gap_register_callback(ble_gap_cb), TAG, "gap cb");
         ble_identity();
     }
     if (s_mode == APP_BT_CLASSIC || s_mode == APP_BT_BOTH) {
         classic_identity();
     }
     s_ready = true;
+    app_cfg_set_ble_adv_rpc(adv_restart_hook);
     kick_timer_apply();
     ESP_LOGI(TAG, "ready (mode %s)", app_cfg_bt_mode_name(s_mode));
     return ESP_OK;
@@ -432,6 +677,9 @@ esp_err_t app_bt_core_hid_start(void)
         }
 #endif
     }
+    /* BLE advertising is a policy decision: ask for it only after the BLE HID
+     * service is up, and only when BLE is configured to expose classes. */
+    adv_policy_enable();
     /* Reports are routed whenever at least one transport came up. */
     app_usb_hid_attach_bt(app_bt_core_hid_connected, app_bt_core_hid_send);
     ESP_LOGI(TAG, "HID ready (ble %u B, classic %u B)%s",
