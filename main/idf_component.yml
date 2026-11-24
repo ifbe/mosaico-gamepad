@@ -5,6 +5,8 @@ dependencies:
     override_path: "../../../submodule/esp-mosaico-bsp/components/esp-mosaico-bsp"
   esp_iris:
     version: "*"
+    # The USB composite hooks come from patches/0001-esp-iris-usb-composite.patch,
+    # applied to this checkout with patches/apply.sh (see patches/README.md).
     override_path: "../../../submodule/esp-mosaico-utils/ESP-Iris/components/esp_iris"
   espressif/esp-gsp: "==1.5.1"
   # The BSP display adapter uses headers deprecated by LVGL 9.6.

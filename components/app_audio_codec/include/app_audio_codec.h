@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "app_audio_core.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -23,9 +24,15 @@ extern "C" {
 typedef enum {
     APP_AUDIO_SOURCE_NONE = 0,
     APP_AUDIO_SOURCE_USB,
-    APP_AUDIO_SOURCE_BT,
-    /* Local features (BOOT-key loopback): borrows the speaker briefly and takes
-     * part in the microphone fan-out like any other consumer. */
+    /* The three Bluetooth links can be active independently (BLE and Classic are
+     * separate radios from the host's point of view), so each gets its own
+     * stream, gain and queue slot. A2DP and HFP share the Classic link, but a
+     * phone pauses media when a call starts. */
+    APP_AUDIO_SOURCE_BT_A2DP,
+    APP_AUDIO_SOURCE_BT_HFP,
+    APP_AUDIO_SOURCE_BT_LE,
+    /* Locally generated playback (file / network PCM). Nothing in this build
+     * pushes to it yet; the slot and the API are ready for that source. */
     APP_AUDIO_SOURCE_LOCAL,
 } app_audio_source_t;
 
@@ -44,6 +51,12 @@ void app_audio_codec_playback_stop(app_audio_source_t source);
 
 /** True when @p source is the stream currently being heard (policy result). */
 bool app_audio_codec_is_heard(app_audio_source_t source);
+
+/** Global audio processing switch (settings page). While disabled the codec
+ *  keeps running but every playback write is dropped and the microphone reports
+ *  silence, so the device stays enumerated without producing sound. */
+void app_audio_codec_set_enabled(bool enabled);
+bool app_audio_codec_enabled(void);
 
 /** Current I2S rate (set by the playback source; capture follows it). A consumer
  *  registered with this rate needs no resampling at all. */
@@ -72,11 +85,21 @@ esp_err_t app_audio_codec_write(const void *data, size_t bytes);
  * USB-only or dual-source setup runs at 48 kHz while a call-only setup can drop
  * to 16 kHz. */
 #define APP_AUDIO_MIX_MAX_RATE 48000
+/* Never go below this. The ES8311 microphone shares the I2S clock with the
+ * speaker; dropping to the SCO rate (16 kHz) left the capture channel running
+ * at 48 kHz while the ring was declared 16 kHz, and that 3x mismatch made the
+ * HF uplink send three times the audio (robot voice on the phone). */
+#ifndef APP_AUDIO_MIX_MIN_RATE
+#define APP_AUDIO_MIX_MIN_RATE 48000
+#endif
 
-/** Submit interleaved 16-bit stereo PCM from @p source running at @p sample_rate.
- *  Never blocks on the I2S: data is queued and mixed by the codec. */
+/** Submit the decoder's raw PCM from @p source at @p sample_rate.
+ *
+ * @p channels is the layout the decoder produced (1 for SCO/LC3, 2 for A2DP and
+ * USB); @p frames counts frames, not samples. Never blocks on the I2S: the data
+ * is queued, and the mixer resamples, expands mono to stereo and sums. */
 esp_err_t app_audio_codec_playback_write(app_audio_source_t source, uint32_t sample_rate,
-                                         const void *data, size_t bytes);
+                                         uint8_t channels, const void *data, size_t frames);
 
 /** Reserved mixing hook: per-source gain in Q16 (0x10000 = unity). */
 esp_err_t app_audio_codec_set_gain_q16(app_audio_source_t source, int32_t gain_q16);
@@ -107,13 +130,8 @@ void app_audio_codec_mic_stop(void);
  * block when their rate equals the capture rate (zero copy) and resample into
  * their own buffer otherwise. Each consumer keeps its own cursor.
  */
-typedef struct {
-    app_audio_source_t source;
-    uint32_t sample_rate;
-    /* Read position in the shared ring, Q16 (high 16 bits = frame index). A
-     * fractional position lets any ratio be resampled, not just integer ones. */
-    uint32_t pos_q16;
-} app_audio_mic_consumer_t;
+/* One cursor in the shared microphone ring (owned by app_audio_core). */
+typedef app_audio_core_mic_reader_t app_audio_mic_consumer_t;
 
 /** Register a consumer of the microphone stream. Returns ESP_OK on success. */
 esp_err_t app_audio_codec_mic_consumer_add(app_audio_mic_consumer_t *consumer,

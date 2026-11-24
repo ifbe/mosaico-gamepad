@@ -2,6 +2,8 @@
 
 #include "app_audio_codec.h"
 
+#include "app_audio_core.h"
+
 #include "bsp/audio.h"
 #include "bsp/power.h"
 #include "bsp/esp_mosaico.h"
@@ -20,10 +22,6 @@ static const char *TAG = "audio_codec";
 /* Master switch for the playback mixer. With 0 every transport writes straight
  * to the codec (single source, codec follows the source rate). Kept as a
  * compile-time switch while the mixer is being debugged. */
-#ifndef APP_AUDIO_MIX_ENABLE
-#define APP_AUDIO_MIX_ENABLE 0
-#endif
-
 /* Microphone fan-out: 1 = one capture task feeds all consumers through a shared
  * ring; 0 = each consumer reads the I2S microphone directly (single consumer at
  * a time). Kept as a switch while the capture path is being debugged. */
@@ -33,20 +31,17 @@ static const char *TAG = "audio_codec";
 #define APP_AUDIO_BT_GAIN_Q16 0x18000
 #endif
 
-#ifndef APP_AUDIO_MIC_FANOUT_ENABLE
-#define APP_AUDIO_MIC_FANOUT_ENABLE 0
-#endif
-
 
 /* Dynamic I2S rate = min(cap, max(active playback source rate)). Declared here
- * because both the transport API and the mixer use it. */
-static volatile uint32_t s_mix_rate;
+ * because both the transport API and the mixer use it. Starts at the fallback
+ * rate: with nothing playing the mixer must keep the codec open, not reopen it
+ * at 0 Hz (which the I2S driver rejects and leaves the capture side conflicting). */
+static volatile uint32_t s_mix_rate = APP_AUDIO_MIX_MAX_RATE;
 /* Defined with the playback mixer further down; the speaker bring-up starts it. */
-static void mix_task(void *arg);
+static void i2s_out_task(void *arg);
 static TaskHandle_t s_mix_task;
 static void codec_watchdog_task(void *arg);
 static bool s_watchdog_started;
-static SemaphoreHandle_t s_mix_wake;
 /* Output volume in percent. USB sets it from the host; Bluetooth has no volume
  * channel, so while a peer is heard the DAC runs at 100% and the peer's own
  * volume control stays authoritative. */
@@ -54,9 +49,11 @@ static int s_out_vol_pct = 80;
 static app_audio_source_t playback_selected(void);
 
 static void audio_codec_apply_volume(void);
+static bool is_bt_source(app_audio_source_t source);
 
 static esp_codec_dev_handle_t s_speaker;
 static uint32_t s_speaker_rate;
+static bool s_slots_gain_ready;
 static esp_codec_dev_handle_t s_microphone;
 static uint32_t s_mic_rate;
 
@@ -66,7 +63,7 @@ static void audio_codec_apply_volume(void)
     if (s_speaker == NULL) {
         return;
     }
-    const int pct = playback_selected() == APP_AUDIO_SOURCE_BT ? 100 : s_out_vol_pct;
+    const int pct = is_bt_source(playback_selected()) ? 100 : s_out_vol_pct;
     (void)esp_codec_dev_set_out_vol(s_speaker, pct);
 }
 
@@ -241,7 +238,33 @@ esp_err_t app_audio_codec_start_at(uint32_t sample_rate)
     const int ret = esp_codec_dev_open(s_speaker, &info);
     ESP_RETURN_ON_FALSE(ret == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "codec open (%d)", ret);
     audio_codec_apply_volume();
+    /* Level compensation per transport, applied by the mixer when it pulls.
+     * Bluetooth decodes a few dB below full scale; USB and local features do
+     * not. Producers always queue raw PCM. */
+    if (s_slots_gain_ready == false) {
+        app_audio_core_set_gain_q16(APP_AUDIO_SLOT_A2DP, APP_AUDIO_BT_GAIN_Q16);
+        app_audio_core_set_gain_q16(APP_AUDIO_SLOT_HFP, APP_AUDIO_BT_GAIN_Q16);
+        app_audio_core_set_gain_q16(APP_AUDIO_SLOT_LE, APP_AUDIO_BT_GAIN_Q16);
+        app_audio_core_set_gain_q16(APP_AUDIO_SLOT_USB, 0x10000);
+        app_audio_core_set_gain_q16(APP_AUDIO_SLOT_LOCAL, 0x10000);
+        s_slots_gain_ready = true;
+    }
     s_speaker_rate = sample_rate;
+    /* The speaker and the microphone share one I2S port. Opening the speaker
+     * (re)configures that port, so the capture side must be reopened as well -
+     * otherwise RX stays disabled and every read fails with "channel is not
+     * enabled". Forcing the rate to 0 defeats the "same rate, nothing to do"
+     * shortcut in app_audio_codec_mic_start_at(). */
+    if (s_microphone != NULL) {
+        (void)esp_codec_dev_close(s_microphone);
+        s_microphone = NULL;
+        s_mic_rate = 0;
+        const esp_err_t mic_err = app_audio_codec_mic_start_at(sample_rate);
+        if (mic_err != ESP_OK) {
+            ESP_LOGW(TAG, "capture reopen after speaker open failed: %s",
+                     esp_err_to_name(mic_err));
+        }
+    }
     ESP_LOGI(TAG, "speaker ready (%u Hz, 16-bit, stereo)", (unsigned)sample_rate);
     /* The mixer runs from the moment the codec exists: with no active source it
      * writes silence, which keeps the I2S DMA from replaying a stale block. */
@@ -251,18 +274,13 @@ esp_err_t app_audio_codec_start_at(uint32_t sample_rate)
             s_watchdog_started = true;
         }
     }
-#if APP_AUDIO_MIX_ENABLE
-    if (s_mix_wake == NULL) {
-        s_mix_wake = xSemaphoreCreateBinary();
-    }
     if (s_mix_task == NULL) {
-        if (xTaskCreatePinnedToCore(mix_task, "audio_mix", 4096, NULL, 4, NULL, 0) == pdPASS) {
+        if (xTaskCreatePinnedToCore(i2s_out_task, "i2s_out", 4096, NULL, 4, NULL, 0) == pdPASS) {
             s_mix_task = (TaskHandle_t)1; /* marker: running */
         } else {
-            ESP_LOGE(TAG, "cannot start the playback mixer");
+            ESP_LOGE(TAG, "cannot start the i2s output task");
         }
     }
-#endif
     return ESP_OK;
 #endif /* AUDIO_CODEC_DIAG */
 }
@@ -298,8 +316,17 @@ typedef struct {
     int64_t last_write_us; /* last time this stream handed data over */
 } codec_stream_t;
 
+static bool is_bt_source(app_audio_source_t source)
+{
+    return source == APP_AUDIO_SOURCE_BT_A2DP || source == APP_AUDIO_SOURCE_BT_HFP ||
+           source == APP_AUDIO_SOURCE_BT_LE;
+}
+
+/* Priority order: a call wins over music, then LE, then USB, then local. */
 static codec_stream_t s_streams[] = {
-    {APP_AUDIO_SOURCE_BT, false, 48000, 0},
+    {APP_AUDIO_SOURCE_BT_HFP, false, 48000, 0},
+    {APP_AUDIO_SOURCE_BT_A2DP, false, 48000, 0},
+    {APP_AUDIO_SOURCE_BT_LE, false, 48000, 0},
     {APP_AUDIO_SOURCE_USB, false, 48000, 0},
     {APP_AUDIO_SOURCE_LOCAL, false, 48000, 0},
 };
@@ -332,6 +359,7 @@ static void mix_slot_clear(app_audio_source_t source);
 
 /* A2DP reports "suspended" seconds after the host actually pauses, so decide by
  * starvation instead: no data for 400 ms means the stream is over. */
+
 #define CODEC_STREAM_STALE_US (400 * 1000)
 
 static void codec_watchdog_task(void *arg)
@@ -360,27 +388,12 @@ esp_err_t app_audio_codec_playback_start(app_audio_source_t source, uint32_t sam
     st->active = true;
     st->rate = sample_rate;
     const app_audio_source_t selected = playback_selected();
-#if APP_AUDIO_MIX_ENABLE
-    /* The mixer owns the I2S rate: sources are resampled into it. */
-    (void)app_audio_codec_start_at(s_mix_rate);
-#endif
-    if (s_speaker != NULL && selected == APP_AUDIO_SOURCE_BT) {
-    }
-    /* Reapply after the (possible) reopen: reopen used to reset the volume to the
-     * USB host value, which made Bluetooth quiet again. */
     audio_codec_apply_volume();
-    const codec_stream_t *sel = codec_stream(selected);
-#if APP_AUDIO_MIX_ENABLE
-    const uint32_t rate = s_mix_rate;
-#else
-    const uint32_t rate = sel != NULL ? sel->rate : s_mix_rate;
-#endif
-    const esp_err_t err = app_audio_codec_start_at(rate);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "playback start %d Hz at %u Hz (heard: %d)", (int)source,
-                 (unsigned)rate, (int)selected);
-    }
-    return err;
+    /* The mixer thread owns the I2S rate and every codec reopen: doing it here
+     * would block the protocol callback that reported the stream. */
+    ESP_LOGI(TAG, "playback start source %d (mix at %u Hz, heard: %d)", (int)source,
+             (unsigned)s_mix_rate, (int)selected);
+    return ESP_OK;
 }
 
 void app_audio_codec_playback_stop(app_audio_source_t source)
@@ -393,22 +406,31 @@ void app_audio_codec_playback_stop(app_audio_source_t source)
     /* Mixer bookkeeping: drop whatever this source had queued. No-op when the
      * mixer is disabled (no slot was ever created). */
     mix_slot_clear(source);
-    const app_audio_source_t selected = playback_selected();
-    const codec_stream_t *sel = codec_stream(selected);
-    const uint32_t rate = sel != NULL ? sel->rate : APP_AUDIO_MIX_MAX_RATE;
-    if (app_audio_codec_start_at(rate) == ESP_OK) {
-        if (s_speaker != NULL) {
-            /* Restore the volume the USB host had set (Bluetooth had taken the
-             * DAC to 100%). */
-            (void)esp_codec_dev_set_out_vol(s_speaker, s_out_vol_pct);
-        }
-        ESP_LOGI(TAG, "playback stop %d (heard: %d)", (int)source, (int)selected);
+    if (s_speaker != NULL) {
+        /* Restore the volume the USB host had set (Bluetooth had taken the DAC
+         * to 100%). The mixer thread handles any rate change. */
+        (void)esp_codec_dev_set_out_vol(s_speaker, s_out_vol_pct);
     }
+    ESP_LOGI(TAG, "playback stop %d (heard: %d)", (int)source,
+             (int)playback_selected());
 }
 
 /* Defined with the microphone fan-out further down; queried here so transports
  * can register a consumer at the rate the I2S is actually running. */
 static volatile uint32_t s_mic_src_rate;
+
+static bool s_enabled = true;
+
+void app_audio_codec_set_enabled(bool enabled)
+{
+    s_enabled = enabled;
+    ESP_LOGI(TAG, "audio processing %s", enabled ? "on" : "off");
+}
+
+bool app_audio_codec_enabled(void)
+{
+    return s_enabled;
+}
 
 uint32_t app_audio_codec_i2s_rate(void)
 {
@@ -432,225 +454,223 @@ esp_err_t app_audio_codec_write(const void *data, size_t bytes)
     return ret == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
 }
 
-/* ---- playback mixing ------------------------------------------------------
- * Every transport owns a queue that stores its PCM *as received*, at its own
- * rate. When the I2S needs a block, the mixer takes the matching time span from
- * each queue, resamples it to the output rate and sums. Resampling therefore
- * happens at pull time, where the output block is known exactly.
- *
- * No drift compensation yet: a source that runs faster simply fills its queue
- * and the oldest frames are dropped.
+/* ---- I2S output consumer ---------------------------------------------------
+ * This task is the playback consumer itself (not an extra mixing layer): it
+ * asks app_audio_core for a mixed block and writes it to the I2S. The queues
+ * live in app_audio_core; this thread is their single consumer:
+ * it pulls every active slot (already resampled to the I2S rate and scaled by
+ * the slot gain), sums them and writes one block. Producers (transport
+ * callbacks) only push and notify, so no callback is ever blocked by the DMA.
  */
 
-/* One slot per transport that can play at the same time: USB, Bluetooth,
- * local (BOOT loopback / test tone), plus headroom.
- * Each slot costs MIX_RING_FRAMES * 4 bytes of internal RAM. */
-#define MIX_SOURCES 4
-#define MIX_BLOCK_FRAMES 240 /* 5 ms at 48 kHz */
-#define MIX_RING_FRAMES 2048 /* ~43 ms at 48 kHz of native-rate audio */
-
-typedef struct {
-    app_audio_source_t source;
-    bool used;
-    uint32_t rate;
-    int16_t queue[MIX_RING_FRAMES * 2]; /* native rate, interleaved stereo */
-    uint32_t head;                      /* frames pushed */
-    uint32_t tail;                      /* frames consumed */
-    uint32_t phase_q16;                 /* fractional position past tail */
-    int32_t gain_q16;
-    int64_t last_push_us;               /* last time this queue received data */
-} mix_source_t;
-
-static mix_source_t s_mix[MIX_SOURCES];
-/* Running I2S rate: min(cap, max(active source rate)), recomputed whenever the
- * set of sources changes. */
-static volatile uint32_t s_mix_rate = APP_AUDIO_MIX_MAX_RATE;
-static portMUX_TYPE s_mix_lock = portMUX_INITIALIZER_UNLOCKED;
-/* Given by every queue push so the mixer thread sleeps until there is work
- * (declared above, next to the other mixer forward declarations). */
-
-/* A queue that has not received anything for this long is not part of the
- * "wait for all channels" set: it is paused, not slow. */
+/* A 5 ms block at 48 kHz. */
+#define MIX_BLOCK_FRAMES 240
+/* A queue that has not received anything for this long is treated as paused, so
+ * its empty queue does not hold the block back. */
 #define MIX_SOURCE_IDLE_US (150 * 1000)
+/* Sum into this buffer, then saturate. Static: the mixer task stack is small. */
+static int16_t s_mix_out[MIX_BLOCK_FRAMES * 2];
 
-static mix_source_t *mix_slot(app_audio_source_t source, bool create)
+static int slot_for_source(app_audio_source_t source)
 {
-    for (int i = 0; i < MIX_SOURCES; ++i) {
-        if (s_mix[i].used && s_mix[i].source == source) {
-            return &s_mix[i];
-        }
+    switch (source) {
+    case APP_AUDIO_SOURCE_BT_A2DP:
+        return APP_AUDIO_SLOT_A2DP;
+    case APP_AUDIO_SOURCE_BT_HFP:
+        return APP_AUDIO_SLOT_HFP;
+    case APP_AUDIO_SOURCE_BT_LE:
+        return APP_AUDIO_SLOT_LE;
+    case APP_AUDIO_SOURCE_USB:
+        return APP_AUDIO_SLOT_USB;
+    case APP_AUDIO_SOURCE_LOCAL:
+        return APP_AUDIO_SLOT_LOCAL;
+    default:
+        return -1;
     }
-    if (!create) {
-        return NULL;
-    }
-    for (int i = 0; i < MIX_SOURCES; ++i) {
-        if (!s_mix[i].used) {
-            memset(&s_mix[i], 0, sizeof(s_mix[i]));
-            s_mix[i].used = true;
-            s_mix[i].source = source;
-            s_mix[i].gain_q16 = 0x10000; /* unity until a policy changes it */
-            return &s_mix[i];
-        }
-    }
-    return NULL;
 }
 
-/* min(cap, max(active source rate)); reopen the codec when it changes. */
+/* Highest rate among the slots that are actually running; the I2S follows it. */
 static void mix_rate_update(void)
 {
     uint32_t target = 0;
-    for (int i = 0; i < MIX_SOURCES; ++i) {
-        if (s_mix[i].used && s_mix[i].rate > target) {
-            target = s_mix[i].rate;
+    for (int i = 0; i < APP_AUDIO_SLOT_COUNT; ++i) {
+        const uint32_t rate = app_audio_core_slot_rate(i);
+        if (rate > target) {
+            target = rate;
         }
     }
     if (target == 0 || target > APP_AUDIO_MIX_MAX_RATE) {
         target = APP_AUDIO_MIX_MAX_RATE;
     }
-    if (target == s_mix_rate) {
-        return;
+    if (target < APP_AUDIO_MIX_MIN_RATE) {
+        /* See APP_AUDIO_MIX_MIN_RATE: the capture clock must stay in step with
+         * what the microphone ring declares. */
+        target = APP_AUDIO_MIX_MIN_RATE;
     }
-#if !APP_AUDIO_MIX_ENABLE
-    s_mix_rate = target;
-    return;
-#endif
-    if (app_audio_codec_start_at(target) != ESP_OK) {
-        ESP_LOGE(TAG, "cannot switch I2S to %u Hz", (unsigned)target);
-        return;
+    if (target != s_mix_rate) {
+        s_mix_rate = target;
+        ESP_LOGI(TAG, "mix rate -> %u Hz", (unsigned)target);
     }
-    s_mix_rate = target;
-    ESP_LOGI(TAG, "mix rate -> %u Hz", (unsigned)target);
 }
 
-static void mix_task(void *arg)
+/* Statistics of the playback consumer: one line every 10 s. */
+#define I2S_OUT_STATS_US (10 * 1000 * 1000)
+
+static void i2s_out_stats(uint32_t rate, uint32_t mask, uint32_t frames, int32_t peak,
+                          uint32_t errors, uint32_t mix_calls, const uint32_t *starved)
+{
+    ESP_LOGI(TAG, "i2s_out: rate=%u mask=0x%02x frames=%u peak=%d wr_err=%u q=[%u,%u,%u,%u,%u]",
+             (unsigned)rate, (unsigned)mask, (unsigned)frames, (int)peak, (unsigned)errors,
+             (unsigned)app_audio_core_slot_queued(APP_AUDIO_SLOT_A2DP),
+             (unsigned)app_audio_core_slot_queued(APP_AUDIO_SLOT_HFP),
+             (unsigned)app_audio_core_slot_queued(APP_AUDIO_SLOT_LE),
+             (unsigned)app_audio_core_slot_queued(APP_AUDIO_SLOT_USB),
+             (unsigned)app_audio_core_slot_queued(APP_AUDIO_SLOT_LOCAL));
+    uint32_t gaps = 0;
+    for (int i = 0; i < APP_AUDIO_SLOT_COUNT; ++i) {
+        gaps += starved[i];
+    }
+    ESP_LOGI(TAG, "i2s_out: pulled=[%u,%u,%u,%u,%u] starved=[%u,%u,%u,%u,%u] gaps=%u calls=%u",
+             (unsigned)app_audio_core_slot_take_delivered(APP_AUDIO_SLOT_A2DP),
+             (unsigned)app_audio_core_slot_take_delivered(APP_AUDIO_SLOT_HFP),
+             (unsigned)app_audio_core_slot_take_delivered(APP_AUDIO_SLOT_LE),
+             (unsigned)app_audio_core_slot_take_delivered(APP_AUDIO_SLOT_USB),
+             (unsigned)app_audio_core_slot_take_delivered(APP_AUDIO_SLOT_LOCAL),
+             (unsigned)starved[0], (unsigned)starved[1], (unsigned)starved[2],
+             (unsigned)starved[3], (unsigned)starved[4], (unsigned)gaps,
+             (unsigned)mix_calls);
+}
+
+static void i2s_out_task(void *arg)
 {
     (void)arg;
-    static int16_t out[MIX_BLOCK_FRAMES * 2];
-    /* Prebuffer before the first block (and after a pause) so the DMA never
-     * runs dry; then emit fixed 5 ms blocks. */
-#define MIX_PREROLL_FRAMES 960 /* 20 ms at 48 kHz */
-    bool running = false;
+    s_mix_task = xTaskGetCurrentTaskHandle();
+    app_audio_core_set_playback_wake(s_mix_task);
+    ESP_LOGI(TAG, "i2s_out consumer started (mix %u Hz)", (unsigned)s_mix_rate);
+
+    int64_t window_us = esp_timer_get_time();
+    uint32_t frames = 0, errors = 0, calls = 0;
+    int32_t peak = 0;
+    uint32_t last_mask = 0;
+    /* Queue level extremes and underrun blocks, per slot, for the window. */
+    uint32_t q_min[APP_AUDIO_SLOT_COUNT];
+    uint32_t q_max[APP_AUDIO_SLOT_COUNT];
+    for (int i = 0; i < APP_AUDIO_SLOT_COUNT; ++i) {
+        q_min[i] = UINT32_MAX;
+        q_max[i] = 0;
+    }
 
     for (;;) {
-        const uint32_t rate = s_mix_rate;
-        uint32_t block_max = rate / 200; /* 5 ms */
-        if (block_max > MIX_BLOCK_FRAMES) {
-            block_max = MIX_BLOCK_FRAMES;
+        uint32_t rate = s_mix_rate;
+        if (rate == 0) {
+            /* Never reopen the codec at 0 Hz: the driver rejects the clock and
+             * the capture channel ends up on a different rate than playback. */
+            rate = s_speaker_rate != 0 ? s_speaker_rate : APP_AUDIO_MIX_MAX_RATE;
+        }
+        if (s_speaker_rate != rate && app_audio_codec_start_at(rate) == ESP_OK) {
+            ESP_LOGI(TAG, "I2S rate -> %u Hz", (unsigned)rate);
         }
 
-        /* How much can every live queue contribute right now? */
-        uint32_t producible = UINT32_MAX;
-        bool any = false;
-        taskENTER_CRITICAL(&s_mix_lock);
-        for (int s = 0; s < MIX_SOURCES; ++s) {
-            mix_source_t *m = &s_mix[s];
-            if (!m->used || m->rate == 0) {
-                continue;
-            }
-            const uint32_t step = (uint32_t)(((uint64_t)m->rate << 16) / rate);
-            if (step == 0) {
-                continue;
-            }
-            const int64_t now_us = esp_timer_get_time();
-            if (m->last_push_us != 0 && now_us - m->last_push_us > MIX_SOURCE_IDLE_US) {
-                continue; /* paused stream: must not cap the block */
-            }
-            any = true;
-            const uint32_t avail = m->head - m->tail;
-            const uint32_t can = avail < 2 ? 0 : (uint32_t)(((uint64_t)(avail - 1) << 16) / step);
-            if (can < producible) {
-                producible = can;
-            }
+        uint32_t block = rate / 200; /* 5 ms */
+        if (block > MIX_BLOCK_FRAMES) {
+            block = MIX_BLOCK_FRAMES;
         }
-        taskEXIT_CRITICAL(&s_mix_lock);
-
-        if (!any) {
-            /* Nothing active: keep the DMA fed with silence. */
-            memset(out, 0, block_max * 4);
-            (void)app_audio_codec_write(out, block_max * 4);
-            xSemaphoreTake(s_mix_wake, pdMS_TO_TICKS(10));
-            running = false;
-            continue;
+        if (block == 0) {
+            block = 1;
         }
 
-        if (!running && producible < MIX_PREROLL_FRAMES) {
-            /* Fill the cushion first; the DMA is still playing what we wrote. */
-            xSemaphoreTake(s_mix_wake, pdMS_TO_TICKS(20));
-            continue;
-        }
-        if (producible < block_max) {
-            /* Low water: wait for the next push instead of emitting a tiny block. */
-            if (xSemaphoreTake(s_mix_wake, pdMS_TO_TICKS(10)) == pdFALSE) {
-                memset(out, 0, block_max * 4);
-                (void)app_audio_codec_write(out, block_max * 4);
-                running = false;
+        /* Policy: every active link participates in the mix. app_audio_core
+         * mixes (and fills silence for the links that are still buffering), so
+         * the block can go straight to the I2S. */
+        uint32_t mask = 0;
+        for (int slot = 0; slot < APP_AUDIO_SLOT_COUNT; ++slot) {
+            if (app_audio_core_slot_active(slot)) {
+                mask |= APP_AUDIO_CORE_SLOT(slot);
             }
-            continue;
         }
-        running = true;
+        (void)app_audio_core_mix(mask, rate, 2, s_mix_out, block);
+        if (app_audio_codec_write(s_mix_out, block * 4) != ESP_OK) {
+            ++errors;
+        }
+        /* Record tap: the same mixed block the speaker hears. */
+        app_audio_core_record_push(s_mix_out, block);
 
-        const uint32_t block = block_max;
-        memset(out, 0, block * 4);
-        taskENTER_CRITICAL(&s_mix_lock);
-        for (int s = 0; s < MIX_SOURCES; ++s) {
-            mix_source_t *m = &s_mix[s];
-            if (!m->used || m->rate == 0) {
+        frames += (uint32_t)block;
+        last_mask = mask;
+        ++calls;
+        /* Queue level right after the mix: the low-water mark is what decides
+         * whether this block had enough audio or had to be filled with silence. */
+        for (int slot = 0; slot < APP_AUDIO_SLOT_COUNT; ++slot) {
+            if ((mask & APP_AUDIO_CORE_SLOT(slot)) == 0) {
                 continue;
             }
-            const uint32_t step = (uint32_t)(((uint64_t)m->rate << 16) / rate);
-            if (step == 0) {
-                continue;
+            const uint32_t q = (uint32_t)app_audio_core_slot_queued(slot);
+            if (q < q_min[slot]) {
+                q_min[slot] = q;
             }
-            const uint32_t need = (((block - 1) * step) >> 16) + 2;
-            if (m->head - m->tail < need) {
-                continue; /* this source is silent for this block */
+            if (q > q_max[slot]) {
+                q_max[slot] = q;
             }
-            uint32_t pos = m->phase_q16;
-            for (uint32_t i = 0; i < block; ++i) {
-                const uint32_t idx = pos >> 16;
-                const uint32_t frac = pos & 0xFFFFu;
-                const uint32_t i0 = (m->tail + idx) % MIX_RING_FRAMES;
-                const uint32_t i1 = (m->tail + idx + 1) % MIX_RING_FRAMES;
-                const int32_t l0 = m->queue[i0 * 2];
-                const int32_t l1 = m->queue[i1 * 2];
-                const int32_t r0 = m->queue[i0 * 2 + 1];
-                const int32_t r1 = m->queue[i1 * 2 + 1];
-                const int32_t ls = l0 + (((l1 - l0) * (int32_t)frac) >> 16);
-                const int32_t rs = r0 + (((r1 - r0) * (int32_t)frac) >> 16);
-                int32_t l = out[i * 2] + (ls * m->gain_q16) / 0x10000;
-                int32_t r = out[i * 2 + 1] + (rs * m->gain_q16) / 0x10000;
-                if (l > 32767) {
-                    l = 32767;
-                } else if (l < -32768) {
-                    l = -32768;
-                }
-                if (r > 32767) {
-                    r = 32767;
-                } else if (r < -32768) {
-                    r = -32768;
-                }
-                out[i * 2] = (int16_t)l;
-                out[i * 2 + 1] = (int16_t)r;
-                pos += step;
-            }
-            m->tail += pos >> 16;
-            m->phase_q16 = pos & 0xFFFFu;
         }
-        taskEXIT_CRITICAL(&s_mix_lock);
-        if (app_audio_codec_write(out, block * 4) != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+        for (size_t i = 0; i < block * 2; ++i) {
+            const int32_t v = s_mix_out[i];
+            const int32_t a = v < 0 ? -v : v;
+            if (a > peak) {
+                peak = a;
+            }
         }
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - window_us >= I2S_OUT_STATS_US) {
+            const uint32_t starved[APP_AUDIO_SLOT_COUNT] = {
+                app_audio_core_slot_take_starved(APP_AUDIO_SLOT_A2DP),
+                app_audio_core_slot_take_starved(APP_AUDIO_SLOT_HFP),
+                app_audio_core_slot_take_starved(APP_AUDIO_SLOT_LE),
+                app_audio_core_slot_take_starved(APP_AUDIO_SLOT_USB),
+                app_audio_core_slot_take_starved(APP_AUDIO_SLOT_LOCAL),
+            };
+            ESP_LOGI(TAG, "i2s_out: q_min=[%u,%u,%u,%u,%u] q_max=[%u,%u,%u,%u,%u]",
+                     (unsigned)(q_min[0] == UINT32_MAX ? 0 : q_min[0]),
+                     (unsigned)(q_min[1] == UINT32_MAX ? 0 : q_min[1]),
+                     (unsigned)(q_min[2] == UINT32_MAX ? 0 : q_min[2]),
+                     (unsigned)(q_min[3] == UINT32_MAX ? 0 : q_min[3]),
+                     (unsigned)(q_min[4] == UINT32_MAX ? 0 : q_min[4]),
+                     (unsigned)q_max[0], (unsigned)q_max[1], (unsigned)q_max[2],
+                     (unsigned)q_max[3], (unsigned)q_max[4]);
+            for (int i = 0; i < APP_AUDIO_SLOT_COUNT; ++i) {
+                q_min[i] = UINT32_MAX;
+                q_max[i] = 0;
+            }
+            i2s_out_stats(rate, last_mask, frames, peak, errors, calls, starved);
+            window_us = now_us;
+            frames = 0;
+            errors = 0;
+            calls = 0;
+            peak = 0;
+        }
+        /* Wake on a push, but never sleep longer than one block. */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
     }
 }
 
 esp_err_t app_audio_codec_playback_write(app_audio_source_t source, uint32_t sample_rate,
-                                         const void *data, size_t bytes)
+                                         uint8_t channels, const void *data, size_t frames)
 {
-    if (data == NULL || bytes < 4 || sample_rate == 0) {
+    if (data == NULL || frames == 0 || sample_rate == 0 || (channels != 1 && channels != 2)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_speaker == NULL) {
+        /* Diagnostic (gamepad): a push before the speaker exists is dropped
+         * silently, which looks exactly like "the transport sent nothing". */
+        static int64_t last_warn_us;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_warn_us > 2 * 1000 * 1000) {
+            last_warn_us = now_us;
+            ESP_LOGW(TAG, "push source %d dropped: codec not started yet", (int)source);
+        }
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_enabled) {
+        return ESP_OK; /* muted by the settings page */
     }
     codec_stream_t *live = codec_stream(source);
     if (live != NULL) {
@@ -662,122 +682,50 @@ esp_err_t app_audio_codec_playback_write(app_audio_source_t source, uint32_t sam
         }
         live->last_write_us = esp_timer_get_time();
     }
-#if !APP_AUDIO_MIX_ENABLE
-    /* Single-stream policy: the highest-priority active source is heard, the
-     * others still hand their data over and it is dropped here. */
-    if (!app_audio_codec_is_heard(source)) {
-        return ESP_OK;
-    }
-    const codec_stream_t *st = codec_stream(source);
-    const uint32_t want = st != NULL ? st->rate : sample_rate;
-    if (s_speaker_rate != want) {
-        if (app_audio_codec_start_at(want) != ESP_OK) {
-            return ESP_FAIL;
-        }
-    }
-#if APP_AUDIO_BT_GAIN_Q16 != 0x10000
-    if (source == APP_AUDIO_SOURCE_BT) {
-        /* The peer sets its own loudness, but SBC decodes below full scale and
-         * the ES8311 output is shared with USB; lift Bluetooth digitally so both
-         * end up at a comparable level. Saturating, never wrapping. */
-        static int16_t boosted[480 * 2];
-        const int16_t *in = (const int16_t *)data;
-        const size_t frames = bytes / 4;
-        size_t done = 0;
-        while (done < frames) {
-            size_t n = frames - done;
-            if (n > 480) {
-                n = 480;
-            }
-            for (size_t i = 0; i < n; ++i) {
-                int32_t l = ((int32_t)in[(done + i) * 2] * APP_AUDIO_BT_GAIN_Q16) >> 16;
-                int32_t r = ((int32_t)in[(done + i) * 2 + 1] * APP_AUDIO_BT_GAIN_Q16) >> 16;
-                if (l > 32767) {
-                    l = 32767;
-                } else if (l < -32768) {
-                    l = -32768;
-                }
-                if (r > 32767) {
-                    r = 32767;
-                } else if (r < -32768) {
-                    r = -32768;
-                }
-                boosted[i * 2] = (int16_t)l;
-                boosted[i * 2 + 1] = (int16_t)r;
-            }
-            if (app_audio_codec_write(boosted, n * 4) != ESP_OK) {
-                return ESP_FAIL;
-            }
-            done += n;
-        }
-        return ESP_OK;
-    }
-#endif
-    return app_audio_codec_write(data, bytes);
-#else
-    mix_source_t *m = mix_slot(source, true);
-    if (m == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    m->rate = sample_rate;
-    mix_rate_update();
 
-    /* Queue the PCM exactly as received: resampling happens when the mixer
-     * pulls, where the output block and its time span are known. */
-    const int16_t *in = (const int16_t *)data;
-    const size_t in_frames = bytes / 4; /* stereo 16-bit */
-    taskENTER_CRITICAL(&s_mix_lock);
-    for (size_t i = 0; i < in_frames; ++i) {
-        if (m->head - m->tail >= MIX_RING_FRAMES) {
-            /* Overrun: keep the newest audio and drop the oldest. */
-            m->tail = m->head - MIX_RING_FRAMES + 1;
-            m->phase_q16 = 0;
+    const int slot = slot_for_source(source);
+    if (slot < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Raw PCM goes into the ring: level policy lives in the consumer (per-slot
+     * gain), so changing it never requires re-queuing audio. */
+    const esp_err_t err = app_audio_core_playback_push(slot, sample_rate, channels,
+                                                       (const int16_t *)data, frames);
+    if (err == ESP_OK) {
+        mix_rate_update();
+    } else {
+        /* A rejected push used to be invisible: the transports drop the return
+         * value, so the path went silent without a single log line. */
+        static int64_t last_warn_us;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_warn_us > 5 * 1000 * 1000) {
+            last_warn_us = now_us;
+            ESP_LOGW(TAG, "playback queue rejected source %d: %s", (int)source,
+                     esp_err_to_name(err));
         }
-        const uint32_t pos = m->head % MIX_RING_FRAMES;
-        m->queue[pos * 2] = in[i * 2];
-        m->queue[pos * 2 + 1] = in[i * 2 + 1];
-        ++m->head;
     }
-    m->last_push_us = esp_timer_get_time();
-    taskEXIT_CRITICAL(&s_mix_lock);
-    if (s_mix_wake != NULL) {
-        xSemaphoreGive(s_mix_wake);
-    }
-    return ESP_OK;
-#endif /* APP_AUDIO_MIX_ENABLE */
+    return err;
 }
 
 esp_err_t app_audio_codec_set_gain_q16(app_audio_source_t source, int32_t gain_q16)
 {
-    mix_source_t *m = mix_slot(source, false);
-    if (m == NULL) {
+    const int slot = slot_for_source(source);
+    if (slot < 0) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (gain_q16 < 0) {
-        gain_q16 = 0;
-    } else if (gain_q16 > 0x10000) {
-        gain_q16 = 0x10000;
-    }
-    m->gain_q16 = gain_q16;
+    app_audio_core_set_gain_q16(slot, gain_q16);
     return ESP_OK;
 }
 
-/* Mixer bookkeeping when a source stops; the public wrapper below calls it. */
+/* Drop whatever a source had queued when it stops. */
 static void mix_slot_clear(app_audio_source_t source)
 {
-    mix_source_t *m = mix_slot(source, false);
-    if (m == NULL) {
-        return;
+    const int slot = slot_for_source(source);
+    if (slot >= 0) {
+        app_audio_core_playback_drop(slot);
+        mix_rate_update();
     }
-    taskENTER_CRITICAL(&s_mix_lock);
-    m->head = 0;
-    m->tail = 0;
-    m->phase_q16 = 0;
-    m->used = false;
-    taskEXIT_CRITICAL(&s_mix_lock);
-    mix_rate_update();
 }
-
 
 esp_err_t app_audio_codec_mic_start_at(uint32_t sample_rate)
 {
@@ -864,16 +812,17 @@ esp_err_t app_audio_codec_set_volume(int percent)
 /* Capture and playback share one I2S clock, so the microphone must run at the
  * same rate as the current speaker stream (s_mic_src_rate is declared above).
  * Consumers resample away from it. */
-#define MIC_FANOUT_RING 960 /* 20 ms at 48 kHz, 44 ms at 22 kHz: plenty */
 #define MIC_FANOUT_BATCH 240 /* stereo frames per capture read */
 
-static int16_t s_mic_ring[MIC_FANOUT_RING];
-static volatile uint32_t s_mic_head; /* mono frames published so far */
 static int16_t s_mic_stereo[MIC_FANOUT_BATCH * 2];
+static int16_t s_mic_mono[MIC_FANOUT_BATCH];
 static volatile int s_mic_consumers;
 static TaskHandle_t s_mic_task;
+/* Capture rate diagnostics: published mono frames over a 5 s window. */
+static uint32_t published;
+static uint32_t window_ms;
 
-static void mic_fanout_task(void *arg)
+static void i2s_in_task(void *arg)
 {
     (void)arg;
     while (s_mic_consumers > 0) {
@@ -885,11 +834,20 @@ static void mic_fanout_task(void *arg)
                 continue;
             }
             s_mic_src_rate = want;
+            app_audio_core_mic_set_rate(want);
             ESP_LOGI(TAG, "microphone running at %u Hz", (unsigned)want);
         }
         size_t got = 0;
-        if (app_audio_codec_mic_read(s_mic_stereo, sizeof(s_mic_stereo), &got) != ESP_OK ||
-            got < 4) {
+        if (app_audio_codec_mic_read(s_mic_stereo, sizeof(s_mic_stereo), &got) != ESP_OK) {
+            /* The I2S RX side can be left disabled when the port is
+             * reconfigured: force a real reopen instead of spinning on a dead
+             * channel (the rate shortcut would otherwise return OK forever). */
+            s_mic_rate = 0;
+            (void)app_audio_codec_mic_start_at(s_mic_src_rate != 0 ? s_mic_src_rate : want);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (got < 4) {
             vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
@@ -899,12 +857,22 @@ static void mic_fanout_task(void *arg)
          * carries one mono signal. Take the left slot instead of averaging: if
          * the codec leaves the right slot at zero, (L+R)/2 would cost 6 dB. */
         for (size_t i = 0; i < frames; ++i) {
-            s_mic_ring[(s_mic_head + i) % MIC_FANOUT_RING] = stereo[i * 2];
+            s_mic_mono[i] = stereo[i * 2];
         }
-        s_mic_head += (uint32_t)frames; /* single producer, publish last */
+        /* Publish to the shared ring: consumers keep their own cursors. */
+        app_audio_core_mic_publish(s_mic_mono, frames);
+        published += (uint32_t)frames;
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - window_ms >= 5000) {
+            const uint32_t dt = now_ms - window_ms;
+            ESP_LOGI(TAG, "mic capture %u frames/s", (unsigned)(published * 1000u / dt));
+            window_ms = now_ms;
+            published = 0;
+        }
     }
     app_audio_codec_mic_stop();
     s_mic_src_rate = 0;
+    app_audio_core_mic_set_rate(0); /* readers report "no data" until it restarts */
     s_mic_task = NULL;
     vTaskDelete(NULL);
 }
@@ -912,111 +880,37 @@ static void mic_fanout_task(void *arg)
 esp_err_t app_audio_codec_mic_consumer_add(app_audio_mic_consumer_t *consumer,
                                            app_audio_source_t source, uint32_t sample_rate)
 {
+    (void)source; /* the reader keeps its own rate; the ring is shared */
     if (consumer == NULL || sample_rate == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-#if !APP_AUDIO_MIC_FANOUT_ENABLE
-    /* Direct mode: the consumer owns the capture path, no shared ring. */
-    consumer->source = source;
-    consumer->sample_rate = sample_rate;
-    consumer->pos_q16 = 0;
-    return app_audio_codec_mic_start_at(sample_rate);
-#else
-    consumer->source = source;
-    consumer->sample_rate = sample_rate;
-    consumer->pos_q16 = s_mic_head << 16;
+    ESP_RETURN_ON_ERROR(app_audio_core_mic_reader_add(consumer, sample_rate), TAG,
+                        "mic reader");
     ++s_mic_consumers;
     if (s_mic_task == NULL) {
-        if (xTaskCreatePinnedToCore(mic_fanout_task, "mic_fan", 4096, NULL, 3, NULL, 0) !=
+        if (xTaskCreatePinnedToCore(i2s_in_task, "i2s_in", 4096, NULL, 3, NULL, 0) !=
             pdPASS) {
             --s_mic_consumers;
+            app_audio_core_mic_reader_remove(consumer);
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG, "microphone fan-out started, %u Hz to %u Hz",
+        ESP_LOGI(TAG, "microphone fan-out started, %u Hz capture to %u Hz",
                  (unsigned)(s_speaker_rate != 0 ? s_speaker_rate : 48000),
                  (unsigned)sample_rate);
     }
     return ESP_OK;
-#endif /* APP_AUDIO_MIC_FANOUT_ENABLE */
 }
 
 void app_audio_codec_mic_consumer_remove(app_audio_mic_consumer_t *consumer)
 {
-#if !APP_AUDIO_MIC_FANOUT_ENABLE
-    (void)consumer;
-    app_audio_codec_mic_stop();
-#else
-    if (consumer != NULL && s_mic_consumers > 0) {
+    app_audio_core_mic_reader_remove(consumer);
+    if (s_mic_consumers > 0) {
         --s_mic_consumers;
     }
-#endif
 }
 
 size_t app_audio_codec_mic_consumer_read(app_audio_mic_consumer_t *consumer,
                                          int16_t *mono_out, size_t frames)
 {
-    if (consumer == NULL || mono_out == NULL || frames == 0) {
-        return 0;
-    }
-#if !APP_AUDIO_MIC_FANOUT_ENABLE
-    /* Direct mode: read the I2S microphone, keep the left channel (the ES8311
-     * ADC is mono). Chunked so a large request never needs a big stack buffer. */
-    static int16_t stereo[240 * 2];
-    const size_t chunk_max = sizeof(stereo) / (2 * sizeof(int16_t));
-    size_t done = 0;
-    while (done < frames) {
-        size_t chunk = frames - done;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        size_t got = 0;
-        if (app_audio_codec_mic_read(stereo, chunk * 4, &got) != ESP_OK || got < 4) {
-            break;
-        }
-        const size_t n = got / 4;
-        for (size_t i = 0; i < n; ++i) {
-            mono_out[done + i] = stereo[i * 2];
-        }
-        done += n;
-        if (n < chunk) {
-            break;
-        }
-    }
-    if (done < frames) {
-        memset(&mono_out[done], 0, (frames - done) * sizeof(int16_t));
-    }
-    return frames;
-#else
-    const uint32_t src = s_mic_src_rate;
-    const uint32_t head = s_mic_head;
-    if (src == 0 || head < 2) {
-        memset(mono_out, 0, frames * sizeof(int16_t));
-        return frames;
-    }
-
-    /* Keep the consumer inside the ring: replaying stale audio sounds worse than
-     * skipping it. */
-    const uint32_t floor_frame = consumer->pos_q16 >> 16;
-    if (head > floor_frame && head - floor_frame > MIC_FANOUT_RING) {
-        consumer->pos_q16 = (head - MIC_FANOUT_RING) << 16;
-    }
-
-    /* Position advance per output frame, Q16. Linear interpolation in between
-     * handles any ratio, integer (48k->16k) or fractional (44.1k->48k). */
-    const uint32_t step_q16 = (src << 16) / consumer->sample_rate;
-
-    for (size_t i = 0; i < frames; ++i) {
-        const uint32_t pos = consumer->pos_q16 >> 16;
-        const uint32_t frac = consumer->pos_q16 & 0xFFFFu;
-        if (pos + 1 >= head) {
-            mono_out[i] = 0; /* not enough fresh frames yet: keep the cadence */
-        } else {
-            const int32_t s0 = s_mic_ring[pos % MIC_FANOUT_RING];
-            const int32_t s1 = s_mic_ring[(pos + 1) % MIC_FANOUT_RING];
-            mono_out[i] = (int16_t)(s0 + (((s1 - s0) * (int32_t)frac) >> 16));
-        }
-        consumer->pos_q16 += step_q16;
-    }
-    return frames;
-#endif /* APP_AUDIO_MIC_FANOUT_ENABLE */
+    return app_audio_core_mic_read(consumer, mono_out, frames);
 }

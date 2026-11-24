@@ -34,10 +34,11 @@ static const char *TAG = "bt_classic";
 #define MIC_READ_FRAMES (HFP_FRAMES * 3) /* 10 ms at 48 kHz: the I2S read
                                           * granularity the codec is built around;
                                           * shorter chunks returned nothing. */
-static int16_t s_hfp_stereo[HFP_FRAMES * 6 * 2]; /* SCO 8/16 kHz -> 48 kHz */
 static int16_t s_hfp_mono[HFP_FRAMES];
 
 static bool s_started;
+static bool s_a2dp_enabled;   /* persisted bt_audio: speaker mask */
+static bool s_hfp_enabled;    /* persisted bt_audio: microphone mask */
 static bool s_connected;      /* A2DP link */
 static bool s_paired;
 static int s_hfp_state = -1;   /* esp_hf_client_connection_state_t */
@@ -53,6 +54,9 @@ static volatile uint32_t s_legacy_rx;
  * through the audio-state event; resampling must follow it or the pitch is off. */
 static uint32_t s_sco_rate = 8000;
 /* Uplink ring: the legacy send() callback pulls from here. */
+/* Default SCO packet size in 16-bit PCM bytes, used for the very first fetch
+ * before the stack has told us what it wants (mSBC asks for 240). */
+#define HFP_SCO_PKT_BYTES 240
 #define SCO_UP_BYTES 1024 /* ~64 ms at 8 kHz: low latency, room for jitter */
 static uint8_t s_sco_up[SCO_UP_BYTES];
 static volatile uint32_t s_sco_up_head;
@@ -66,10 +70,12 @@ static volatile uint32_t s_legacy_calls; /* send() invocations */
 static volatile uint32_t s_legacy_empty; /* send() called with an empty ring */
 static volatile uint32_t s_sco_tx;   /* SCO frames sent to the phone */
 /* Uplink instrumentation: how the stack pulls data and how fast we refill. */
+static volatile uint32_t s_pull_need;       /* bytes the stack asked for last time */
 static volatile uint32_t s_pull_calls;      /* outgoing callback invocations */
 static volatile uint32_t s_pull_req_bytes;  /* bytes the stack asked for */
 static volatile uint32_t s_pull_out_bytes;  /* bytes actually handed over */
 static volatile uint32_t s_pull_empty;      /* callbacks that found no data */
+static volatile uint32_t s_pull_short;      /* callbacks answered below the request */
 static volatile uint32_t s_ready_calls;     /* outgoing_data_ready() calls */
 static volatile uint32_t s_mic_iters;       /* mic task iterations */
 static volatile uint32_t s_mic_bytes;       /* bytes appended to the ring */
@@ -115,7 +121,8 @@ static uint32_t a2dp_rate_from_mcc(const esp_a2d_mcc_t *mcc)
 static void a2dp_data_cb(const uint8_t *data, uint32_t len)
 {
     /* No permission check: the codec decides whether this stream is heard. */
-    if (app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT, s_a2dp_rate, data, len) != ESP_OK) {
+    if (app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT_A2DP, s_a2dp_rate, 2, data,
+                                       len / 4) != ESP_OK) {
         ESP_LOGW(TAG, "a2dp write failed (%u bytes)", (unsigned)len);
     }
 }
@@ -126,7 +133,7 @@ static void a2dp_start_streaming(uint32_t rate)
         return;
     }
     s_a2dp_rate = rate;
-    if (app_audio_codec_playback_start(APP_AUDIO_SOURCE_BT, rate) != ESP_OK) {
+    if (app_audio_codec_playback_start(APP_AUDIO_SOURCE_BT_A2DP, rate) != ESP_OK) {
         ESP_LOGE(TAG, "codec cannot switch to %u Hz", (unsigned)rate);
         return;
     }
@@ -141,7 +148,7 @@ static void a2dp_stop_streaming(void)
     }
     s_a2dp_streaming = false;
     /* Only report the stop: the codec falls back to whatever is still active. */
-    app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
+    app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT_A2DP);
     ESP_LOGI(TAG, "a2dp stopped");
 }
 
@@ -154,9 +161,11 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (s_connected) {
             /* The phone often brings up only the media profile; pull in the
              * hands-free profile too, otherwise calls never reach SCO. */
-            memcpy(s_hfp_peer, param->conn_stat.remote_bda, sizeof(s_hfp_peer));
-            const esp_err_t herr = esp_hf_client_connect(s_hfp_peer);
-            ESP_LOGI(TAG, "starting HFP: %s", esp_err_to_name(herr));
+            if (s_hfp_enabled) {
+                memcpy(s_hfp_peer, param->conn_stat.remote_bda, sizeof(s_hfp_peer));
+                const esp_err_t herr = esp_hf_client_connect(s_hfp_peer);
+                ESP_LOGI(TAG, "starting HFP: %s", esp_err_to_name(herr));
+            }
         } else {
             a2dp_stop_streaming();
         }
@@ -190,21 +199,18 @@ static void hfp_legacy_recv(const uint8_t *buf, uint32_t len)
     }
     const int16_t *mono = (const int16_t *)buf;
     size_t frames = len / sizeof(int16_t);
-    const uint32_t k = sco_factor();
-    if (frames > HFP_FRAMES * 6 / k) {
-        frames = HFP_FRAMES * 6 / k;
+    if (frames > HFP_FRAMES) {
+        frames = HFP_FRAMES;
     }
-    for (size_t i = 0; i < frames; ++i) {
-        const int16_t s0 = mono[i];
-        const int16_t s1 = (i + 1 < frames) ? mono[i + 1] : mono[i];
-        for (uint32_t j = 0; j < k; ++j) {
-            const int32_t v = s0 + (((int32_t)(s1 - s0) * (int32_t)j) / (int32_t)k);
-            s_hfp_stereo[(i * k + j) * 2] = (int16_t)v;
-            s_hfp_stereo[(i * k + j) * 2 + 1] = (int16_t)v;
-        }
+    /* Raw SCO mono at the native rate; the mixer expands and resamples. */
+    const esp_err_t perr = app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT_HFP,
+                                                          s_sco_rate, 1, mono, frames);
+    /* Diagnostic (gamepad): one line per 100 downlink packets. */
+    static uint32_t rx_calls;
+    if (++rx_calls <= 5 || rx_calls % 500 == 0) {
+        ESP_LOGI(TAG, "hfp rx: len=%u rate=%u frames=%u push=%s", (unsigned)len,
+                 (unsigned)s_sco_rate, (unsigned)frames, esp_err_to_name(perr));
     }
-    (void)app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT, 48000, s_hfp_stereo,
-                                         frames * k * 2 * sizeof(int16_t));
 }
 
 static uint32_t hfp_legacy_send(uint8_t *buf, uint32_t len)
@@ -213,6 +219,9 @@ static uint32_t hfp_legacy_send(uint8_t *buf, uint32_t len)
         ESP_LOGI(TAG, "sco pull packet %u bytes, codec rate %u",
                  (unsigned)len, (unsigned)s_sco_rate);
     }
+    /* What the stack asks for is the contract; the mic task signals "ready"
+     * only once this much is queued. */
+    s_pull_need = len;
     ++s_legacy_calls;
     ++s_pull_calls;
     s_pull_req_bytes += len;
@@ -223,6 +232,11 @@ static uint32_t hfp_legacy_send(uint8_t *buf, uint32_t len)
     while (n < len && s_sco_up_tail != s_sco_up_head) {
         buf[n++] = s_sco_up[s_sco_up_tail % SCO_UP_BYTES];
         ++s_sco_up_tail;
+    }
+    if (n < len) {
+        /* Cannot happen while the reader gates on s_pull_need; counted so a
+         * regression shows up instead of silently killing the uplink. */
+        ++s_pull_short;
     }
     if (n == 0) {
         ++s_legacy_empty;
@@ -240,6 +254,7 @@ static void hfp_mic_task(void *arg)
 {
     (void)arg;
     static int16_t mic48[MIC_READ_FRAMES];
+    ESP_LOGI(TAG, "bt_mic consumer started (SCO %u Hz)", (unsigned)s_sco_rate);
     while (s_sco_active) {
         const size_t frames = app_audio_codec_mic_consumer_read(&s_sco_mic, mic48,
                                                                 MIC_READ_FRAMES);
@@ -282,7 +297,7 @@ static void hfp_mic_task(void *arg)
                     rate_amp = v;
                 }
             }
-            if (now_ms - rate_ms >= 5000) {
+            if (now_ms - rate_ms >= 10000) {
                 const uint32_t dt = now_ms - rate_ms;
                 ESP_LOGI(TAG, "mic rate: %u iters/s, %u B/s, amp=%d",
                          (unsigned)(rate_iters * 1000 / dt),
@@ -297,27 +312,25 @@ static void hfp_mic_task(void *arg)
         if (level > s_ring_peak) {
             s_ring_peak = level;
         }
-        /* Voice-over-HCI is pull based: the stack only calls the outgoing
-         * callback after this signal. */
-        ++s_ready_calls;
-        esp_hf_client_outgoing_data_ready();
-        if (frames == 0) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
+        /* Voice-over-HCI is pull based: the stack fetches one SCO packet only
+         * after this signal, and mSBC requires *exactly* HF_SBC_ENC_RAW_DATA_SIZE
+         * (240) bytes of 16-bit PCM - bta_hf_client_co.c drops the whole packet
+         * when the callback returns anything else. Signalling while the ring
+         * holds less than one packet therefore sent nothing at all: the phone
+         * got a silent uplink while the downlink worked. */
+        const uint32_t need = s_pull_need != 0 ? s_pull_need : HFP_SCO_PKT_BYTES;
+        /* Keep a second packet in reserve: the stack fetches about twice per
+         * signal and an mSBC frame is 240 B = 7.5 ms while the mic produces in
+         * 5 ms steps, so a single-packet gate left every second fetch with only
+         * 80 B, which the encoder drops. Two packets (15 ms) are what the phone
+         * tested clean with. */
+        if (level >= need * 2) {
+            ++s_ready_calls;
+            esp_hf_client_outgoing_data_ready();
         }
-        /* Also push through the newer API with the correct length (out frames,
-         * not the 48 kHz input length). Whichever path the stack uses gets data. */
-        const size_t bytes = out * sizeof(int16_t);
-        esp_hf_audio_buff_t *buff = esp_hf_client_audio_buff_alloc((uint16_t)bytes);
-        if (buff != NULL) {
-            memcpy(buff->data, s_hfp_mono, bytes);
-            buff->data_len = (uint16_t)bytes;
-            if (esp_hf_client_audio_data_send(s_sco_handle, buff) != ESP_OK) {
-                ++s_send_errs;
-                esp_hf_client_audio_buff_free(buff);
-            } else {
-                s_sco_tx += (uint32_t)out;
-            }
+        if (frames == 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
         }
     }
     s_mic_task = NULL;
@@ -339,19 +352,8 @@ static void hfp_audio_data_cb(esp_hf_sync_conn_hdl_t handle, esp_hf_audio_buff_t
         if (frames > HFP_FRAMES) {
             frames = HFP_FRAMES;
         }
-        /* SCO is 16 kHz; the codec stays at 48 kHz. Linear 3x upsampling keeps
-         * the I2S configuration untouched (16 kHz reopens were unreliable). */
-        for (size_t i = 0; i < frames; ++i) {
-            const int16_t s0 = mono[i];
-            const int16_t s1 = (i + 1 < frames) ? mono[i + 1] : mono[i];
-            for (int k = 0; k < 3; ++k) {
-                const int32_t v = s0 + (((int32_t)(s1 - s0) * k) / 3);
-                s_hfp_stereo[(i * 3 + k) * 2] = (int16_t)v;
-                s_hfp_stereo[(i * 3 + k) * 2 + 1] = (int16_t)v;
-            }
-        }
-        (void)app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT, 48000, s_hfp_stereo,
-                                             frames * 3 * 2 * sizeof(int16_t));
+        (void)app_audio_codec_playback_write(APP_AUDIO_SOURCE_BT_HFP, s_sco_rate, 1, mono,
+                                             frames);
     }
     esp_hf_client_audio_buff_free(audio_buf);
 }
@@ -366,15 +368,15 @@ static void hfp_sco_start(void)
     if (s_sco_active) {
         return;
     }
-    const esp_err_t perr = app_audio_codec_playback_start(APP_AUDIO_SOURCE_BT, 48000);
+    const esp_err_t perr = app_audio_codec_playback_start(APP_AUDIO_SOURCE_BT_HFP, 48000);
     if (perr != ESP_OK) {
         ESP_LOGE(TAG, "codec cannot switch to 16 kHz for SCO: %s", esp_err_to_name(perr));
         return;
     }
-    const esp_err_t merr = app_audio_codec_mic_consumer_add(&s_sco_mic, APP_AUDIO_SOURCE_BT, 48000);
+    const esp_err_t merr = app_audio_codec_mic_consumer_add(&s_sco_mic, APP_AUDIO_SOURCE_BT_HFP, 48000);
     if (merr != ESP_OK) {
         ESP_LOGE(TAG, "microphone unavailable for SCO: %s", esp_err_to_name(merr));
-        app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
+        app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT_A2DP);
         return;
     }
     /* Prime the uplink ring with ~20 ms of silence. Without it the ring only
@@ -396,7 +398,7 @@ static void hfp_sco_start(void)
     if (xTaskCreatePinnedToCore(hfp_mic_task, "bt_mic", 4096, NULL, 5, NULL, 0) != pdPASS) {
         s_sco_active = false;
         app_audio_codec_mic_consumer_remove(&s_sco_mic);
-        app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
+        app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT_A2DP);
         return;
     }
     ESP_LOGI(TAG, "sco audio started (16 kHz mono)");
@@ -411,10 +413,14 @@ static void hfp_sco_stop(void)
     while (s_mic_task != NULL) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
+    /* Fresh ring for the next call. */
+    s_pull_need = 0;
+    s_sco_up_head = 0;
+    s_sco_up_tail = 0;
     /* Only drop this consumer: the capture path itself is owned by the fan-out
      * and stays open for the USB consumer. */
     app_audio_codec_mic_consumer_remove(&s_sco_mic);
-    app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT);
+    app_audio_codec_playback_stop(APP_AUDIO_SOURCE_BT_A2DP);
     ESP_LOGI(TAG, "sco audio stopped");
 }
 
@@ -430,7 +436,8 @@ static void bt_status_task(void *arg)
                  "status: codec=%u paired=%d a2dp_link=%d a2dp_stream=%d hfp=%d sco=%d "
                  "sco_try=%d sco_ok=%d call=%d rx=%u tx=%u lx=%u lt=%u "
                  "mf=%u mfail=%u serr=%u lc=%u le=%u "
-                 "pull=%u/%u/%u/%u ready=%u mic=%u/%u peak=%u kick=%u/%u/%ums",
+                 "pull=%u/%u/%u/%u short=%u need=%u ready=%u mic=%u/%u peak=%u "
+                 "kick=%u/%u/%ums",
                  (unsigned)s_sco_rate, (int)s_paired, (int)s_connected,
                  (int)s_a2dp_streaming, s_hfp_state,
                  (int)s_sco_active, s_sco_attempts, s_sco_ok, s_call_status,
@@ -439,7 +446,8 @@ static void bt_status_task(void *arg)
                  (unsigned)s_send_errs, (unsigned)s_legacy_calls, (unsigned)s_legacy_empty,
                  (unsigned)s_pull_calls, (unsigned)s_pull_req_bytes,
                  (unsigned)s_pull_out_bytes, (unsigned)s_pull_empty,
-                 (unsigned)s_ready_calls, (unsigned)s_mic_iters,
+                 (unsigned)s_pull_short, (unsigned)s_pull_need, (unsigned)s_ready_calls,
+                 (unsigned)s_mic_iters,
                  (unsigned)s_mic_bytes, (unsigned)s_ring_peak,
                  kick_count, kick_throttled, kick_age_ms);
     }
@@ -557,49 +565,62 @@ esp_err_t app_btclassic_audio_start(void)
         return ESP_OK;
     }
 
-    /* Audio classes off: do not register A2DP/HFP at all. Hosts decide from the
-     * SDP records (and the class of device) whether this is a speaker; leaving
-     * them registered makes macOS and iOS treat the device as audio only and
-     * never bind HID. */
-    if (app_cfg_bt_audio() == 0) {
-        ESP_LOGI(TAG, "audio profiles disabled by configuration (HID only)");
+    /* Each classic profile is an independent setting: A2DP (speaker) and HFP
+     * (microphone/call audio) can be enabled one at a time, both, or neither.
+     * A profile that is off is never registered, so the SDP records and the
+     * class of device match what the settings page shows. */
+    const uint32_t profiles = app_cfg_bt_audio();
+    const bool want_speaker = (profiles & APP_BT_AUDIO_SPEAKER) != 0;
+    const bool want_mic = (profiles & APP_BT_AUDIO_MIC) != 0;
+    if (!want_speaker && !want_mic) {
+        ESP_LOGI(TAG, "no classic audio profile enabled");
         return ESP_OK;
     }
+    s_a2dp_enabled = want_speaker;
+    s_hfp_enabled = want_mic;
 
     /* The controller, Bluedroid, device name and class of device belong to
      * app_bt; this component only brings up the audio profiles. */
     ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_cb));
 
-    /* Microphone and call audio first: the hands-free profile allocates the SCO
-     * resource, and initialising it after A2DP has been observed to fail. */
-    /* Same order as the IDF hfp_hf example: callbacks first, then init, then the
-     * phonebook client (phones use it when deciding this is a real headset). */
-    ESP_ERROR_CHECK(esp_hf_client_register_callback(hfp_cb));
-    /* Register the Voice-over-HCI data pair *before* init, like the callback: the
-     * stack pulls microphone PCM through `send` in internal-codec mode. */
-    const esp_err_t rerr = esp_hf_client_register_data_callback(hfp_legacy_recv, hfp_legacy_send);
-    esp_err_t err = esp_hf_client_init();
-    const bool hfp_ok = err == ESP_OK;
-    if (hfp_ok) {
-        const esp_err_t aerr = esp_hf_client_register_audio_data_callback(hfp_audio_data_cb);
-        ESP_LOGI(TAG, "hfp data callbacks: legacy=%s audio=%s", esp_err_to_name(rerr),
-                 esp_err_to_name(aerr));
-        (void)esp_pbac_init();
-        ESP_LOGI(TAG, "HFP hands-free ready");
-    } else {
-        ESP_LOGE(TAG, "HFP init failed: %s (speaker only)", esp_err_to_name(err));
+    bool hfp_ok = false;
+    if (s_hfp_enabled) {
+        /* Microphone and call audio first: the hands-free profile allocates the
+         * SCO resource, and initialising it after A2DP has been observed to
+         * fail. Same order as the IDF hfp_hf example: callbacks first, then
+         * init, then the phonebook client (phones use it when deciding this is
+         * a real headset). */
+        ESP_ERROR_CHECK(esp_hf_client_register_callback(hfp_cb));
+        /* Register the Voice-over-HCI data pair *before* init, like the
+         * callback: the stack pulls microphone PCM through `send` in
+         * internal-codec mode. */
+        const esp_err_t rerr =
+            esp_hf_client_register_data_callback(hfp_legacy_recv, hfp_legacy_send);
+        const esp_err_t err = esp_hf_client_init();
+        hfp_ok = err == ESP_OK;
+        if (hfp_ok) {
+            const esp_err_t aerr = esp_hf_client_register_audio_data_callback(hfp_audio_data_cb);
+            ESP_LOGI(TAG, "hfp data callbacks: legacy=%s audio=%s", esp_err_to_name(rerr),
+                     esp_err_to_name(aerr));
+            (void)esp_pbac_init();
+            ESP_LOGI(TAG, "HFP hands-free ready");
+        } else {
+            ESP_LOGE(TAG, "HFP init failed: %s", esp_err_to_name(err));
+        }
     }
 
-    /* Speaker: A2DP sink. */
-    ESP_ERROR_CHECK(esp_a2d_register_callback(a2dp_cb));
-    ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(a2dp_data_cb));
-    ESP_ERROR_CHECK(esp_a2d_sink_init());
+    if (s_a2dp_enabled) {
+        ESP_ERROR_CHECK(esp_a2d_register_callback(a2dp_cb));
+        ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(a2dp_data_cb));
+        ESP_ERROR_CHECK(esp_a2d_sink_init());
+        ESP_LOGI(TAG, "A2DP sink ready");
+    }
 
     if (xTaskCreatePinnedToCore(bt_status_task, "bt_status", 3072, NULL, 1, NULL, 0) != pdPASS) {
         ESP_LOGW(TAG, "status task creation failed");
     }
     s_started = true;
-    ESP_LOGI(TAG, "A2DP sink%s ready", hfp_ok ? " + HFP hands-free" : " only");
+    ESP_LOGI(TAG, "classic audio ready (a2dp=%d hfp=%d)", (int)s_a2dp_enabled, (int)hfp_ok);
     return ESP_OK;
 }
 
@@ -610,9 +631,15 @@ void app_btclassic_audio_stop(void)
     }
     hfp_sco_stop();
     a2dp_stop_streaming();
-    esp_hf_client_deinit();
-    esp_a2d_sink_deinit();
+    if (s_hfp_enabled) {
+        esp_hf_client_deinit();
+    }
+    if (s_a2dp_enabled) {
+        esp_a2d_sink_deinit();
+    }
     s_started = false;
+    s_a2dp_enabled = false;
+    s_hfp_enabled = false;
     s_connected = false;
 }
 

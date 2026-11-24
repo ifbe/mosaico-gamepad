@@ -1,0 +1,339 @@
+diff --git a/include/esp_iris_usb_hid.h b/include/esp_iris_usb_hid.h
+new file mode 100644
+index 0000000..ed08a01
+--- /dev/null
++++ b/include/esp_iris_usb_hid.h
+@@ -0,0 +1,68 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "esp_err.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** One application-owned HID interface appended to the ESP-Iris USB device.
++ *
++ * Iris keeps its own CDC interfaces; these descriptors are composed after
++ * them. All fields are borrowed/copied at registration time and the report
++ * descriptor must stay valid for the lifetime of the USB driver. */
++typedef struct {
++    const uint8_t *report_desc; /* HID report descriptor bytes */
++    uint16_t report_desc_len;   /* byte length of report_desc */
++    uint8_t ep_in;              /* IN endpoint address, e.g. 0x85 */
++    uint8_t ep_size;            /* endpoint max packet size (8 or 64) */
++    uint8_t interval_ms;        /* polling interval in milliseconds */
++} esp_iris_usb_hid_iface_t;
++
++/** Largest number of HID interfaces the composite device can carry. */
++#define ESP_IRIS_USB_HID_MAX 4
++
++/** Register the HID interfaces appended to the ESP-Iris USB device.
++ *
++ * Call before the ESP-Iris USB transport starts (before app_main work that
++ * boots Iris). The table is copied; appending supports at most
++ * ESP_IRIS_USB_HID_MAX entries and cannot exceed CONFIG_TINYUSB_HID_COUNT.
++ * The report descriptor a host fetches comes from the application's
++ * tud_hid_descriptor_report_cb() instance index, which must match this order.
++ */
++esp_err_t esp_iris_usb_set_hid_ifaces(const esp_iris_usb_hid_iface_t *ifaces,
++                                      size_t count);
++
++
++/** First interface number available to application interfaces. Iris always owns
++ * the low numbers for its CDC pairs; build a class-specific descriptor block
++ * against this base and pass it to esp_iris_usb_set_extra_interfaces(). */
++uint8_t esp_iris_usb_first_free_interface(void);
++
++/** Override the USB vendor/product IDs of the composite device.
++ *
++ * Must run before ESP-Iris installs the USB driver (before esp_iris_boot_probe).
++ * Some host software identifies a product by VID/PID only, so an application
++ * may need a different identity than the Espressif development default. */
++esp_err_t esp_iris_usb_set_ids(uint16_t vid, uint16_t pid);
++
++/** Append a complete application interface block (for example USB Audio).
++ *
++ * The bytes are copied and inserted verbatim after Iris' CDC interfaces and
++ * before any registered HID interface. @p interface_count is the number of
++ * standard interface descriptors contained in the block; it must match the
++ * interface numbers computed from esp_iris_usb_first_free_interface().
++ * Passing len == 0 removes a previously registered block. */
++esp_err_t esp_iris_usb_set_extra_interfaces(const uint8_t *desc, size_t len,
++                                            uint8_t interface_count);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/esp_iris_transport_usb.c b/src/esp_iris_transport_usb.c
+index 9658ee8..db1065c 100644
+--- a/src/esp_iris_transport_usb.c
++++ b/src/esp_iris_transport_usb.c
+@@ -1,5 +1,9 @@
+ #include "esp_iris_internal.h"
+ 
++#include <string.h>
++
++#include "esp_iris_usb_hid.h"
++
+ #include <errno.h>
+ #include "esp_log.h"
+ #include "esp_system.h"
+@@ -59,6 +63,149 @@ static void usb_download_line_state(bool dtr, bool rts)
+ _Static_assert(CFG_TUD_CDC >= IRIS_USB_CDC_COUNT,
+                "ESP-Iris 0.2 USB data requires CONFIG_TINYUSB_CDC_COUNT=2");
+ 
++/* Optional composite HID interfaces for applications whose product function
++ * needs USB HID (a gamepad, a mouse, a keyboard). The application registers
++ * its interfaces before Iris starts; Iris keeps its own CDC interfaces, so
++ * device operations and recovery stay on the same cable. Descriptors are
++ * composed at runtime because the application may disable classes at boot. */
++/* Optional application descriptor block (a complete class-specific interface
++ * set, for example USB Audio). Iris appends it verbatim after its CDC pairs and
++ * before any HID interface, so the application builds it against the interface
++ * number reported by esp_iris_usb_first_free_interface(). */
++#define ESP_IRIS_USB_EXTRA_MAX_BYTES 768
++#define ESP_IRIS_USB_EXTRA_MAX_IFACES 8
++
++static uint8_t s_extra_desc[ESP_IRIS_USB_EXTRA_MAX_BYTES];
++static size_t s_extra_len;
++static uint8_t s_extra_ifaces;
++
++esp_err_t esp_iris_usb_set_extra_interfaces(const uint8_t *desc, size_t len,
++                                            uint8_t interface_count)
++{
++    if (len > 0 && desc == NULL) return ESP_ERR_INVALID_ARG;
++    if (len > ESP_IRIS_USB_EXTRA_MAX_BYTES) return ESP_ERR_INVALID_SIZE;
++    if (interface_count > ESP_IRIS_USB_EXTRA_MAX_IFACES) return ESP_ERR_INVALID_SIZE;
++    if ((len == 0) != (interface_count == 0)) return ESP_ERR_INVALID_ARG;
++    if (len > 0) memcpy(s_extra_desc, desc, len);
++    s_extra_len = len;
++    s_extra_ifaces = interface_count;
++    return ESP_OK;
++}
++
++uint8_t esp_iris_usb_first_free_interface(void)
++{
++    return (uint8_t)(IRIS_USB_CDC_COUNT * 2);
++}
++
++/* Standard HID interface (9) + HID class descriptor (9) + IN endpoint (7) = 25
++ * bytes, written explicitly because TinyUSB's TUD_HID_DESCRIPTOR changes shape
++ * with CFG_TUD_HID_INOUT and would break this fixed offset table. Offsets below
++ * patch the interface number, report length, endpoint address/size/interval. */
++static const uint8_t s_hid_template[] = {
++    0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, /* interface descriptor */
++    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00, /* HID descriptor */
++    0x07, 0x05, 0x85, 0x03, 0x08, 0x00, 0x04,             /* IN endpoint */
++};
++#define IRIS_USB_HID_DESC_BYTES ((size_t)sizeof(s_hid_template))
++#define IRIS_USB_HID_OFF_ITF 2
++#define IRIS_USB_HID_OFF_REPORT_LEN 16
++#define IRIS_USB_HID_OFF_EP 20
++#define IRIS_USB_HID_OFF_EP_SIZE 22
++#define IRIS_USB_HID_OFF_INTERVAL 24
++_Static_assert(sizeof(s_hid_template) == 25, "unexpected HID descriptor layout");
++
++/* The table is copied: the caller's array is usually a stack object in
++ * app_main() and must not be referenced after registration. */
++static esp_iris_usb_hid_iface_t s_hid_iface_table[ESP_IRIS_USB_HID_MAX];
++static size_t s_hid_iface_count;
++static uint8_t s_config_fs[9 + IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN +
++                           ESP_IRIS_USB_EXTRA_MAX_BYTES +
++                           ESP_IRIS_USB_HID_MAX * IRIS_USB_HID_DESC_BYTES];
++#if TUD_OPT_HIGH_SPEED
++static uint8_t s_config_hs[9 + IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN +
++                           ESP_IRIS_USB_EXTRA_MAX_BYTES +
++                           ESP_IRIS_USB_HID_MAX * IRIS_USB_HID_DESC_BYTES];
++#endif
++
++esp_err_t esp_iris_usb_set_hid_ifaces(const esp_iris_usb_hid_iface_t *ifaces,
++                                      size_t count)
++{
++    if (count > 0 && ifaces == NULL) return ESP_ERR_INVALID_ARG;
++    if (count > ESP_IRIS_USB_HID_MAX) return ESP_ERR_INVALID_SIZE;
++    if (count > CFG_TUD_HID) return ESP_ERR_INVALID_STATE;
++    for (size_t i = 0; i < count; ++i) {
++        if (ifaces[i].report_desc == NULL || ifaces[i].report_desc_len == 0 ||
++            ifaces[i].ep_in == 0 || ifaces[i].ep_size == 0 ||
++            ifaces[i].interval_ms == 0) {
++            return ESP_ERR_INVALID_ARG;
++        }
++    }
++    memcpy(s_hid_iface_table, ifaces, count * sizeof(s_hid_iface_table[0]));
++    s_hid_iface_count = count;
++    return ESP_OK;
++}
++
++/* The configuration descriptor is composed at runtime by build_config(). */
++static const uint8_t s_cdc_fs[] = {
++    TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 64),
++#if CONFIG_ESP_IRIS_DATA_LINK
++    TUD_CDC_DESCRIPTOR(2, 5, 0x83, 8, 0x04, 0x84, 64),
++#endif
++};
++#if TUD_OPT_HIGH_SPEED
++static const uint8_t s_cdc_hs[] = {
++    TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 512),
++#if CONFIG_ESP_IRIS_DATA_LINK
++    TUD_CDC_DESCRIPTOR(2, 5, 0x83, 8, 0x04, 0x84, 512),
++#endif
++};
++#endif
++
++/* 9-byte configuration descriptor; total length and interface count are
++ * patched per build because the HID interface count is a runtime value. */
++static size_t build_config(uint8_t *buf, size_t cap, bool high_speed)
++{
++    const size_t total = 9 + IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN + s_extra_len +
++                         s_hid_iface_count * IRIS_USB_HID_DESC_BYTES;
++    if (total > cap) return 0;
++
++    buf[0] = 9;
++    buf[1] = TUSB_DESC_CONFIGURATION;
++    buf[2] = (uint8_t)(total & 0xFF);
++    buf[3] = (uint8_t)(total >> 8);
++    buf[4] = (uint8_t)(IRIS_USB_CDC_COUNT * 2 + s_extra_ifaces + s_hid_iface_count);
++    buf[5] = 1;   /* bConfigurationValue */
++    buf[6] = 0;   /* iConfiguration */
++    buf[7] = 0x80; /* bmAttributes: reserved bit 7 set, bus powered */
++    buf[8] = 50;  /* bMaxPower: 100 mA in 2 mA units */
++
++    size_t off = 9;
++    memcpy(&buf[off], high_speed ? s_cdc_hs : s_cdc_fs,
++           IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN);
++    off += IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN;
++
++    /* Application block first: its interface numbers are fixed in the bytes the
++     * application built against esp_iris_usb_first_free_interface(). */
++    if (s_extra_len > 0) {
++        memcpy(&buf[off], s_extra_desc, s_extra_len);
++        off += s_extra_len;
++    }
++
++    uint8_t itf = (uint8_t)(IRIS_USB_CDC_COUNT * 2 + s_extra_ifaces);
++    for (size_t i = 0; i < s_hid_iface_count; ++i) {
++        const esp_iris_usb_hid_iface_t *h = &s_hid_iface_table[i];
++        memcpy(&buf[off], s_hid_template, sizeof(s_hid_template));
++        buf[off + IRIS_USB_HID_OFF_ITF] = itf++;
++        buf[off + IRIS_USB_HID_OFF_REPORT_LEN] = (uint8_t)(h->report_desc_len & 0xFF);
++        buf[off + IRIS_USB_HID_OFF_REPORT_LEN + 1] = (uint8_t)(h->report_desc_len >> 8);
++        buf[off + IRIS_USB_HID_OFF_EP] = h->ep_in;
++        buf[off + IRIS_USB_HID_OFF_EP_SIZE] = h->ep_size;
++        buf[off + IRIS_USB_HID_OFF_INTERVAL] = h->interval_ms;
++        off += sizeof(s_hid_template);
++    }
++    return off;
++}
++
+ /* One USB stack, separate endpoints, decoders and link lifetimes. Only the
+  * protocol task starts/stops interfaces; callbacks publish atomic events. */
+ static iris_runtime_t *s_runtime[IRIS_USB_CDC_COUNT];
+@@ -125,7 +272,9 @@ static const char *s_strings[] = {
+     s_serial, "ESP-Iris 0.2 console", "ESP-Iris 0.2 data",
+ };
+ 
+-static const tusb_desc_device_t s_device = {
++/* Mutable so the application can pick a different USB identity (for example
++ * a Sony-compatible gamepad) before the driver is installed. */
++static tusb_desc_device_t s_device = {
+     .bLength = sizeof(tusb_desc_device_t), .bDescriptorType = TUSB_DESC_DEVICE,
+     .bcdUSB = 0x0200, .bDeviceClass = TUSB_CLASS_MISC,
+     .bDeviceSubClass = MISC_SUBCLASS_COMMON, .bDeviceProtocol = MISC_PROTOCOL_IAD,
+@@ -134,25 +283,13 @@ static const tusb_desc_device_t s_device = {
+     .bcdDevice = 0x0200, .iManufacturer = 1, .iProduct = 2, .iSerialNumber = 3,
+     .bNumConfigurations = 1,
+ };
+-#define IRIS_USB_CONFIG_BYTES (TUD_CONFIG_DESC_LEN + IRIS_USB_CDC_COUNT * TUD_CDC_DESC_LEN)
+-#define IRIS_USB_CONFIG_HEAD TUD_CONFIG_DESCRIPTOR(1, IRIS_USB_CDC_COUNT * 2, 0, \
+-    IRIS_USB_CONFIG_BYTES, 0, 100)
+-static const uint8_t s_fs_config[] = {
+-    IRIS_USB_CONFIG_HEAD,
+-    TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 64),
+-#if CONFIG_ESP_IRIS_DATA_LINK
+-    TUD_CDC_DESCRIPTOR(2, 5, 0x83, 8, 0x04, 0x84, 64),
+-#endif
+-};
+-#if TUD_OPT_HIGH_SPEED
+-static const uint8_t s_hs_config[] = {
+-    IRIS_USB_CONFIG_HEAD,
+-    TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 512),
+-#if CONFIG_ESP_IRIS_DATA_LINK
+-    TUD_CDC_DESCRIPTOR(2, 5, 0x83, 8, 0x04, 0x84, 512),
+-#endif
+-};
+-#endif
++esp_err_t esp_iris_usb_set_ids(uint16_t vid, uint16_t pid)
++{
++    if (vid == 0 || pid == 0) return ESP_ERR_INVALID_ARG;
++    s_device.idVendor = vid;
++    s_device.idProduct = pid;
++    return ESP_OK;
++}
+ 
+ static unsigned interface_for(const iris_runtime_t *runtime)
+ {
+@@ -291,9 +428,15 @@ static esp_err_t usb_start(iris_runtime_t *runtime, iris_transport_state_t *stat
+         config.descriptor.device = &s_device;
+         config.descriptor.string = s_strings;
+         config.descriptor.string_count = sizeof(s_strings) / sizeof(s_strings[0]);
+-        config.descriptor.full_speed_config = s_fs_config;
++        if (build_config(s_config_fs, sizeof(s_config_fs), false) == 0) {
++            return ESP_ERR_INVALID_SIZE;
++        }
++        config.descriptor.full_speed_config = s_config_fs;
+ #if TUD_OPT_HIGH_SPEED
+-        config.descriptor.high_speed_config = s_hs_config;
++        if (build_config(s_config_hs, sizeof(s_config_hs), true) == 0) {
++            return ESP_ERR_INVALID_SIZE;
++        }
++        config.descriptor.high_speed_config = s_config_hs;
+ #endif
+         taskENTER_CRITICAL(&s_link_lock);
+         s_configured = s_suspended = false;
+@@ -384,9 +527,38 @@ static void usb_stop(iris_runtime_t *runtime, iris_transport_state_t *state)
+     state->link_up = state->reported_link_up = false;
+ }
+ 
++/* If the cable is plugged in after boot (or the host missed the first
++ * enumeration) TinyUSB can stay detached with no bus event to react to. Cycle
++ * the D+ pull-up so the host sees a fresh connect; harmless while no host is
++ * attached because nothing enumerates either way. */
++static void usb_hotplug_watchdog(void)
++{
++    static unsigned misses;
++    static TickType_t last_cycle;
++    if (atomic_load(&s_shutting_down)) return;
++    if (tud_mounted()) {
++        misses = 0;
++        return;
++    }
++    if (tud_suspended()) {
++        misses = 0;
++        return;
++    }
++    if (++misses < 200) return; /* ~2 s at the transport poll period */
++    const TickType_t now = xTaskGetTickCount();
++    if (last_cycle != 0 && (TickType_t)(now - last_cycle) < pdMS_TO_TICKS(5000)) return;
++    misses = 0;
++    last_cycle = now;
++    tud_disconnect();
++    vTaskDelay(pdMS_TO_TICKS(50));
++    tud_connect();
++    ESP_LOGI("iris_usb", "USB re-enumeration forced (no host mounted)");
++}
++
+ static iris_link_event_t usb_poll(iris_runtime_t *runtime, iris_transport_state_t *state)
+ {
+     if (atomic_load(&s_shutting_down)) return IRIS_LINK_EVENT_NONE;
++    usb_hotplug_watchdog();
+     const unsigned itf = interface_for(runtime);
+     taskENTER_CRITICAL(&s_link_lock);
+     const uint32_t generation = s_link[itf].generation;
